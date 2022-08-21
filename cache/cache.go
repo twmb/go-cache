@@ -8,6 +8,11 @@
 // Functions in this API that return a KeyState return the state last, rather
 // than the error last: the value and error are cached as a single internal
 // unit and can be thought of as a single value.
+//
+// This package provides three similar types: Cache, Set, and Item. Set and
+// Item are key-only and value-only caches. You may want a key-only cache if
+// you want to ensure logic is ran once / periodically on expiry for every key.
+// You may want a value-only cache as a singleton that is updated as needed.
 package cache
 
 import (
@@ -62,7 +67,7 @@ type (
 		incomplete bool
 	}
 
-	// Cache caches comparable keys to arbitrary values. By default the
+	// Cache caches comparable keys to arbitrary values. By default, the
 	// cache grows without bounds and all keys persist forever. These
 	// limits can be changed with options that are passed to New.
 	Cache[K comparable, V any] struct {
@@ -73,13 +78,17 @@ type (
 		dirty map[K]*ent[V]
 
 		misses int
+
+		quitOnce  sync.Once
+		quitClean chan struct{}
 	}
 
 	cfg struct {
-		maxAge      time.Duration
-		maxStaleAge time.Duration
-		maxErrAge   time.Duration
-		ageSet      bool
+		maxAge            time.Duration
+		maxStaleAge       time.Duration
+		maxErrAge         time.Duration
+		ageSet            bool
+		autoCleanInterval time.Duration
 	}
 
 	opt struct{ fn func(*cfg) }
@@ -132,20 +141,47 @@ func MaxStaleAge(age time.Duration) Opt { return opt{fn: func(c *cfg) { c.maxSta
 // default is MaxAge.
 func MaxErrorAge(age time.Duration) Opt { return opt{fn: func(c *cfg) { c.maxErrAge = age }} }
 
+// AutoCleanInterval begins a goroutine that calls Clean every interval. The
+// goroutine can be quit with StopAutoClean. It is recommended to use an
+// interval that is less than your MaxAge + MaxStaleAge. Values are only
+// candidates to be cleaned after the max age has elapsed. At worst, a value
+// may persist for a total of MaxAge + MaxStaleAge + AutoCleanInterval.
+func AutoCleanInterval(interval time.Duration) Opt {
+	return opt{fn: func(c *cfg) { c.autoCleanInterval = interval }}
+}
+
 // New returns a new cache, with the optional overrides configuring cache
 // semantics. If you do not need to configure a cache at all, the zero value
 // cache is valid and usable.
 func New[K comparable, V any](opts ...Opt) *Cache[K, V] {
-	var c cfg
+	var cfg cfg
 	for _, opt := range opts {
-		opt.apply(&c)
+		opt.apply(&cfg)
 	}
-	if c.maxErrAge == 0 {
-		c.maxErrAge = c.maxAge
+	if cfg.maxErrAge == 0 {
+		cfg.maxErrAge = cfg.maxAge
 	}
-	return &Cache[K, V]{
-		cfg: c,
+	c := &Cache[K, V]{
+		cfg: cfg,
 	}
+
+	if cfg.autoCleanInterval > 0 && c.cfg.maxStaleAge >= 0 {
+		c.quitClean = make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(cfg.autoCleanInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+				case <-c.quitClean:
+					return
+				}
+				c.Clean()
+			}
+		}()
+	}
+
+	return c
 }
 
 // Get returns the cache value for k, running the miss function in a goroutine
@@ -242,7 +278,7 @@ func (c *Cache[K, V]) tryLoadEnt(k K, dirty func()) *ent[V] {
 }
 
 // TryGet returns the value for the given key if it is cached. This returns
-// either the currently loaded value, or if the current load has an error, the
+// either the currently stored value, or if the current store has an error, the
 // stale value if present, or the currently stored error. If nothing is cached,
 // or what is cached is expired, this returns Miss.
 func (c *Cache[K, V]) TryGet(k K) (V, error, KeyState) {
@@ -250,7 +286,7 @@ func (c *Cache[K, V]) TryGet(k K) (V, error, KeyState) {
 	return e.tryGet(0)
 }
 
-// Delete deletes the value for a key and returns the prior value, if loaded
+// Delete deletes the value for a key and returns the prior value, if stored
 // (i.e. the return from TryGet).
 func (c *Cache[K, V]) Delete(k K) (V, error, KeyState) {
 	e := c.tryLoadEnt(k, func() { delete(c.dirty, k) })
@@ -258,7 +294,7 @@ func (c *Cache[K, V]) Delete(k K) (V, error, KeyState) {
 	return e.tryGet(0)
 }
 
-// Expire sets a loaded value to expire immediately, meaning the next Get will
+// Expire sets a stored value to expire immediately, meaning the next Get will
 // be a miss. If stale values are enabled, the next Get will trigger the miss
 // function but still allow the now-stale value to be returned.
 func (c *Cache[K, V]) Expire(k K) {
@@ -268,7 +304,7 @@ func (c *Cache[K, V]) Expire(k K) {
 	}
 }
 
-// Each calls fn for every cached value. If fn returns false, iteration stops.
+// Range calls fn for every cached value. If fn returns false, iteration stops.
 func (c *Cache[K, V]) Range(fn func(K, V, error) bool) {
 	// When ranging, repeated time.Now() calls add up, so we get the
 	// current time when we enter range and avoid it in all tryGet calls.
@@ -321,6 +357,16 @@ func (c *Cache[K, V]) Clean() {
 			}
 		}
 		return true
+	})
+}
+
+// StopAutoClean stops the auto clean goroutine that is began with the
+// AutoClean option.
+func (c *Cache[K, V]) StopAutoClean() {
+	c.quitOnce.Do(func() {
+		if c.quitClean != nil {
+			close(c.quitClean)
+		}
 	})
 }
 
@@ -529,7 +575,7 @@ func newStale[V any](v V, expires int64, age time.Duration) *stale[V] {
 // get always returns the value or the stale value. We do not check if our
 // value is expired: we call this at the end of Get, we must always return
 // something even if it is to be immediately expired.
-func (e *ent[V]) get() (v V, err error, s KeyState) {
+func (e *ent[V]) get() (v V, err error, state KeyState) {
 	l := e.load()
 	var waited bool
 	if l == nil {
@@ -567,7 +613,7 @@ func (e *ent[V]) get() (v V, err error, s KeyState) {
 	return l.v, l.err, Hit
 }
 
-func (e *ent[V]) tryGet(n64 int64) (v V, err error, s KeyState) {
+func (e *ent[V]) tryGet(n64 int64) (v V, err error, state KeyState) {
 	if e == nil {
 		return
 	}
@@ -635,7 +681,7 @@ func NewItem[V any](opts ...Opt) *Item[V] {
 // goroutine if the item is not yet cached. If stale values are enabled, the
 // currently cached value has an error, and there is an unexpired stale value,
 // this returns the stale value and no error.
-func (i *Item[V]) Get(miss func() (V, error)) (v V, err error, s KeyState) {
+func (i *Item[V]) Get(miss func() (V, error)) (v V, err error, state KeyState) {
 	return i.c.Get(struct{}{}, miss)
 }
 
@@ -643,7 +689,7 @@ func (i *Item[V]) Get(miss func() (V, error)) (v V, err error, s KeyState) {
 // currently loaded value, or if the current load has an error, the stale value
 // if present, or the currently stored error. If nothing is cached, or what is
 // cached is expired, this returns Miss.
-func (i *Item[V]) TryGet() (v V, err error, s KeyState) {
+func (i *Item[V]) TryGet() (v V, err error, state KeyState) {
 	return i.c.TryGet(struct{}{})
 }
 
@@ -664,4 +710,94 @@ func (i *Item[V]) Expire() {
 // the load is canceled and Get returns the value from Set.
 func (i *Item[V]) Set(v V) {
 	i.c.Set(struct{}{}, v)
+}
+
+/////////
+// SET //
+/////////
+
+// Set caches a set of keys. By default, the set grows without bounds and all
+// keys persist forever. These limits can be changed with options that are
+// passed to NewSet.
+type Set[K comparable] struct {
+	c Cache[K, struct{}]
+}
+
+// NewSet returns a new Set, with the optional overrides configuring cache
+// semantics. If you do not need to configure an set at all, the zero value set
+// is valid and usable.
+func NewSet[K comparable](opts ...Opt) *Set[K] {
+	var c cfg
+	for _, opt := range opts {
+		opt.apply(&c)
+	}
+	if c.maxErrAge == 0 {
+		c.maxErrAge = c.maxAge
+	}
+	return &Set[K]{
+		c: Cache[K, struct{}]{
+			cfg: c,
+		},
+	}
+}
+
+// Get ensures the key is cached, running the miss function in a goroutine if
+// the key is not yet cached. If stale keys are enabled, the currently cached
+// key has an error, and there is a stale key, this returns with no error and a
+// Stale key state.
+func (s *Set[K]) Get(k K, miss func() error) (err error, state KeyState) {
+	_, err, state = s.c.Get(k, func() (struct{}, error) {
+		return struct{}{}, miss()
+	})
+	return err, state
+}
+
+// TryGet any error for the given key if it is cached. This returns either the
+// currently stored nil error, or if the current store has an error, the stale
+// nil error if present, otherwise the current error. If nothing is cached, or
+// what is cached is expired, this returns Miss.
+func (s *Set[K]) TryGet(k K) (err error, state KeyState) {
+	_, err, state = s.c.TryGet(k)
+	return err, state
+}
+
+// Delete deletes the key and returns the prior stored error if it existed
+// (i.e., the return from TryGet).
+func (s *Set[K]) Delete(k K) (error, KeyState) {
+	_, err, state := s.c.Delete(k)
+	return err, state
+}
+
+// Expire sets the key to expire immediately, meaning the next call to Get will
+// be a miss. If stale keys are enabled, the next Get will trigger the miss
+// function but still allow a now-stale nil error to be returned.
+func (s *Set[K]) Expire(k K) {
+	s.c.Expire(k)
+}
+
+// Range calls fn for every cached key. If fn returns false, iteration stops.
+func (s *Set[K]) Range(fn func(K, error) bool) {
+	s.c.Range(func(k K, _ struct{}, err error) bool {
+		return fn(k, err)
+	})
+}
+
+// Clean deletes all expired keys from the cache. A key is expired if MaxAge is
+// used and the key is older than the max age, or if you manually expired a
+// key. If MaxStaleAge is used and not -1, the entry must be older than MaxAge
+// + MaxStaleAge. If MaxStaleAge is -1, Clean returns immediately.
+func (s *Set[K]) Clean() {
+	s.c.Clean()
+}
+
+// Set sets a key to exist. If the key is currently loading via Get,
+// the load is canceled and Get returns nil.
+func (s *Set[K]) Set(k K) {
+	s.c.Set(k, struct{}{})
+}
+
+// StopAutoClean stops the auto clean goroutine that is began with the
+// AutoClean option.
+func (s *Set[K]) StopAutoClean() {
+	s.c.StopAutoClean()
 }
