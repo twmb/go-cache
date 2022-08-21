@@ -165,6 +165,7 @@ func TestExpires(t *testing.T) {
 		)
 
 		c.Get("foo", func() (string, error) { return "bar", nil }) // prime the stale
+		time.Sleep(2 * time.Nanosecond)
 
 		// Here, we check that the stale is returned while we load.
 		ch := make(chan struct{})
@@ -172,8 +173,8 @@ func TestExpires(t *testing.T) {
 			<-ch
 			return "baz", nil
 		})
-		close(ch)
 		vcheck(t, got[string]{v, err, s}, got[string]{"bar", nil, Stale})
+		close(ch)
 
 		// Here, we check that the stale is returned because it is
 		// expired.  We sleep 10ms to allow the goroutines running the
@@ -242,6 +243,7 @@ func TestExpires(t *testing.T) {
 		c.Set("foo", "bar")
 		c.Expire("foo")
 		v, err, s := c.TryGet("foo")
+		time.Sleep(2 * time.Nanosecond) // past max stale age
 		vcheck(t, got[string]{v, err, s}, got[string]{"", nil, Miss})
 		v, err, s = c.Get("foo", func() (string, error) { return "baz", nil })
 		vcheck(t, got[string]{v, err, s}, got[string]{"baz", nil, Miss})
@@ -249,6 +251,7 @@ func TestExpires(t *testing.T) {
 		// TryGet returns immediately with miss if we are loading and
 		// stale is expired.
 		c.Expire("foo")
+		time.Sleep(2 * time.Nanosecond)
 		ch := make(chan struct{})
 		go func() {
 			defer close(ch)
@@ -258,15 +261,16 @@ func TestExpires(t *testing.T) {
 				return "asdf", nil
 			})
 		}()
-		<-ch
+		<-ch // ensure we are in Get, then we block it
 		v, err, s = c.TryGet("foo")
-		ch <- struct{}{}
+		ch <- struct{}{} // unblock get
 		vcheck(t, got[string]{v, err, s}, got[string]{"", nil, Miss})
 
 		// We expire foo, and return an error. The error is returned
 		// because our stale is expired.
-		<-ch
+		<-ch // ensure Get has returned
 		c.Expire("foo")
+		time.Sleep(2 * time.Nanosecond)
 		c.Get("foo", func() (string, error) { return "", errors.New("err") })
 		v, err, s = c.Get("foo", func() (string, error) { panic("unreachable") })
 		vcheck(t, got[string]{v, err, s}, got[string]{"", errors.New("err"), Hit})
