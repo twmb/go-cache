@@ -17,6 +17,9 @@ type mapInterface[K comparable] interface {
 	LoadOrStore(key K, value any) (actual any, loaded bool)
 	LoadAndDelete(key K) (value any, loaded bool)
 	Delete(K)
+	Swap(key K, value any) (previous any, loaded bool)
+	CompareAndSwap(key K, old, new any) (swapped bool)
+	CompareAndDelete(key K, old any) (deleted bool)
 	Range(func(key K, value any) (shouldContinue bool))
 }
 
@@ -56,6 +59,18 @@ func (m *RWMutexMap[K]) LoadOrStore(key K, value any) (actual any, loaded bool) 
 	return actual, loaded
 }
 
+func (m *RWMutexMap[K]) Swap(key K, value any) (previous any, loaded bool) {
+	m.mu.Lock()
+	if m.dirty == nil {
+		m.dirty = make(map[K]any)
+	}
+
+	previous, loaded = m.dirty[key]
+	m.dirty[key] = value
+	m.mu.Unlock()
+	return
+}
+
 func (m *RWMutexMap[K]) LoadAndDelete(key K) (value any, loaded bool) {
 	m.mu.Lock()
 	value, loaded = m.dirty[key]
@@ -72,6 +87,36 @@ func (m *RWMutexMap[K]) Delete(key K) {
 	m.mu.Lock()
 	delete(m.dirty, key)
 	m.mu.Unlock()
+}
+
+func (m *RWMutexMap[K]) CompareAndSwap(key K, old, new any) (swapped bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.dirty == nil {
+		return false
+	}
+
+	value, loaded := m.dirty[key]
+	if loaded && value == old {
+		m.dirty[key] = new
+		return true
+	}
+	return false
+}
+
+func (m *RWMutexMap[K]) CompareAndDelete(key K, old any) (deleted bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.dirty == nil {
+		return false
+	}
+
+	value, loaded := m.dirty[key]
+	if loaded && value == old {
+		delete(m.dirty, key)
+		return true
+	}
+	return false
 }
 
 func (m *RWMutexMap[K]) Range(f func(key K, value any) (shouldContinue bool)) {
@@ -107,6 +152,11 @@ func (c *CacheMap[K]) Store(key K, value any) {
 	c.c.Set(key, value)
 }
 
+func (c *CacheMap[K]) Swap(key K, value any) (previous any, loaded bool) {
+	v, _, s := c.c.Swap(key, value)
+	return v, s.IsHit()
+}
+
 func (c *CacheMap[K]) LoadOrStore(key K, value any) (actual any, loaded bool) {
 	actual, _, s := c.c.Get(key, func() (any, error) {
 		return value, nil
@@ -117,6 +167,14 @@ func (c *CacheMap[K]) LoadOrStore(key K, value any) (actual any, loaded bool) {
 func (c *CacheMap[K]) LoadAndDelete(key K) (value any, loaded bool) {
 	value, _, s := c.c.Delete(key)
 	return value, s.IsHit()
+}
+
+func (c *CacheMap[K]) CompareAndSwap(key K, old, new any) (swapped bool) {
+	return c.c.CompareAndSwap(key, old, new)
+}
+
+func (c *CacheMap[K]) CompareAndDelete(key K, old any) (deleted bool) {
+	return c.c.CompareAndDelete(key, old)
 }
 
 func (c *CacheMap[K]) Delete(key K) {
