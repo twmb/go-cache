@@ -385,14 +385,7 @@ func (c *Cache[K, V]) StopAutoClean() {
 // previous error if there is no stale. If nothing was cached, this returns
 // Miss.
 func (c *Cache[K, V]) Swap(k K, v V) (old V, oldErr error, oldState KeyState) {
-	l := &loading[V]{
-		v: v,
-	}
-	l.expires.Store(c.cfg.newExpires(nil))
-	l.state.Store(stateFinalized)
-	if c.cfg.maxStaleAge != 0 {
-		l.stale = newStale(v, now(), c.cfg.maxStaleAge)
-	}
+	l := c.finalizedLoading(v)
 
 	var was *loading[V]
 	defer func() {
@@ -400,6 +393,8 @@ func (c *Cache[K, V]) Swap(k K, v V) (old V, oldErr error, oldState KeyState) {
 			return
 		}
 
+		// The following block is similar to setve, but expanded to
+		// return our prior value (or stale, or err) if it exists.
 		now := now()
 		if !was.finalized() {
 			was.mu.Lock()
@@ -477,6 +472,68 @@ func (c *Cache[K, V]) Set(k K, v V) {
 	c.Swap(k, v)
 }
 
+// CompareAndSwap swaps the old and new values for k if the value has finished
+// loading and the value is equal to old. The type V must be comparable.
+func (c *Cache[K, V]) CompareAndSwap(k K, old, new V) bool {
+	r := c.read()
+	if e, ok := r.m[k]; ok {
+		return c.tryCAS(e, old, new, true)
+	} else if !r.incomplete {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r = c.read()
+	if e, ok := r.m[k]; ok {
+		return c.tryCAS(e, old, new, true)
+	} else if e, ok := c.dirty[k]; ok {
+		defer c.missed(r)
+		return c.tryCAS(e, old, new, true)
+	}
+	return false
+}
+
+// CompareAndDelete deletes the entry for k if the value has finished loading
+// the the value is equal to old. The type V must be comparable.
+func (c *Cache[K, V]) CompareAndDelete(k K, old V) (deleted bool) {
+	r := c.read()
+	e, ok := r.m[k]
+	if !ok && r.incomplete {
+		c.mu.Lock()
+		r = c.read()
+		e, ok = r.m[k]
+		if !ok && r.incomplete {
+			e, ok = c.dirty[k]
+			c.missed(r)
+		}
+		c.mu.Unlock()
+	}
+	if ok {
+		return c.tryCAS(e, old, old, false)
+	}
+	return false
+}
+
+func (c *Cache[K, V]) tryCAS(e *ent[V], old, new V, useNew bool) bool {
+	l := e.p.Load()
+	if l == nil || !l.onlyFinalized() || any(l.v) != any(old) {
+		return false
+	}
+	var l2 *loading[V]
+	if useNew {
+		l2 = c.finalizedLoading(new)
+	}
+	for {
+		if e.p.CompareAndSwap(l, l2) {
+			return true
+		}
+		l = e.p.Load()
+		if l == nil || !l.onlyFinalized() || any(l.v) != any(old) {
+			return false
+		}
+	}
+}
+
 //////////////////////
 // CACHE READ/DIRTY //
 //////////////////////
@@ -545,8 +602,21 @@ outer:
 // ENT //
 /////////
 
+func (c *Cache[K, V]) finalizedLoading(v V) *loading[V] {
+	l := &loading[V]{
+		v: v,
+	}
+	l.expires.Store(c.cfg.newExpires(nil))
+	l.state.Store(stateFinalized)
+	if c.cfg.maxStaleAge != 0 {
+		l.stale = newStale(v, now(), c.cfg.maxStaleAge)
+	}
+	return l
+}
+
 func (l *loading[V]) promotingDelete() bool { return l.state.Load() == 2 }
 func (l *loading[V]) finalized() bool       { return l.state.Load() != 0 }
+func (l *loading[V]) onlyFinalized() bool   { return l.state.Load() == 1 }
 
 func (e *ent[V]) del() {
 	if e == nil {
