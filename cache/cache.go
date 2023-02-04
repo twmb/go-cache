@@ -19,7 +19,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 )
 
 // KeyState is returned from cache operations to indicate how a key existed in
@@ -52,15 +51,15 @@ type (
 	loading[V any] struct {
 		v       V
 		err     error
-		expires int64 // nano at which this ent is unusable, if non-zero
+		expires atomic.Int64 // nano at which this ent is unusable, if non-zero
 		stale   *stale[V]
-		state   uint32 // set once; if not set, waitgroup is used
+		state   atomic.Uint32
 
 		wg sync.WaitGroup
 		mu sync.Mutex
 	}
 	ent[V any] struct {
-		p unsafe.Pointer // [nil | promotingDelete | *loading]
+		p atomic.Pointer[loading[V]]
 	}
 	read[K comparable, V any] struct {
 		m          map[K]*ent[V]
@@ -71,13 +70,15 @@ type (
 	// cache grows without bounds and all keys persist forever. These
 	// limits can be changed with options that are passed to New.
 	Cache[K comparable, V any] struct {
-		cfg cfg
-
-		r     unsafe.Pointer // *read
+		r     atomic.Pointer[read[K, V]]
 		mu    sync.Mutex
 		dirty map[K]*ent[V]
 
 		misses int
+
+		cfg cfg
+
+		pd *loading[V] // allocate the promotingDelete pointer once
 
 		quitOnce  sync.Once
 		quitClean chan struct{}
@@ -97,6 +98,12 @@ type (
 	Opt interface {
 		apply(*cfg)
 	}
+)
+
+const (
+	stateLoading uint32 = iota
+	stateFinalized
+	statePromotingDelete
 )
 
 func now() int64 { return time.Now().UnixNano() }
@@ -163,7 +170,9 @@ func New[K comparable, V any](opts ...Opt) *Cache[K, V] {
 	}
 	c := &Cache[K, V]{
 		cfg: cfg,
+		pd:  new(loading[V]),
 	}
+	c.pd.state.Store(statePromotingDelete)
 
 	if cfg.autoCleanInterval > 0 && c.cfg.maxStaleAge >= 0 {
 		c.quitClean = make(chan struct{})
@@ -180,7 +189,6 @@ func New[K comparable, V any](opts ...Opt) *Cache[K, V] {
 			}
 		}()
 	}
-
 	return c
 }
 
@@ -231,9 +239,10 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeySta
 	// In the worst case we race with a concurrent Set and we override its
 	// results.
 	if e != nil {
-		atomic.StorePointer(&e.p, unsafe.Pointer(l))
+		e.p.Store(l)
 	} else {
-		e = &ent[V]{p: unsafe.Pointer(l)}
+		e = new(ent[V])
+		e.p.Store(l)
 		c.storeDirty(r, k, e)
 	}
 	c.mu.Unlock()
@@ -278,9 +287,9 @@ func (c *Cache[K, V]) tryLoadEnt(k K, dirty func()) *ent[V] {
 }
 
 // TryGet returns the value for the given key if it is cached. This returns
-// either the currently stored value, or if the current store has an error, the
-// stale value if present, or the currently stored error. If nothing is cached,
-// or what is cached is expired, this returns Miss.
+// either the currently stored value, or the current stale if the load errored,
+// or the load error if there is no stale. If nothing is cached, or what is
+// cached is expired, this returns Miss.
 func (c *Cache[K, V]) TryGet(k K) (V, error, KeyState) {
 	e := c.tryLoadEnt(k, nil)
 	return e.tryGet(0)
@@ -300,7 +309,7 @@ func (c *Cache[K, V]) Delete(k K) (V, error, KeyState) {
 func (c *Cache[K, V]) Expire(k K) {
 	e := c.tryLoadEnt(k, nil)
 	if l := e.load(); l != nil && l.finalized() {
-		atomic.SwapInt64(&l.expires, now())
+		l.expires.Store(now())
 	}
 }
 
@@ -351,7 +360,7 @@ func (c *Cache[K, V]) Clean() {
 	now := now()
 	c.each(func(k K, e *ent[V]) bool {
 		if l := e.load(); l != nil && l.finalized() {
-			expires := atomic.LoadInt64(&l.expires)
+			expires := l.expires.Load()
 			if expires != 0 && now > expires+int64(c.cfg.maxStaleAge) {
 				c.Delete(k)
 			}
@@ -370,39 +379,58 @@ func (c *Cache[K, V]) StopAutoClean() {
 	})
 }
 
-// Set sets a value for a key. If the key is currently loading via Get, the
-// load is canceled and Get returns the value from Set.
-func (c *Cache[K, V]) Set(k K, v V) {
-	l := &loading[V]{
-		state:   1,
-		v:       v,
-		expires: c.cfg.newExpires(nil),
-	}
-	if c.cfg.maxStaleAge != 0 {
-		l.stale = newStale(v, now(), c.cfg.maxStaleAge)
-	}
-	p := unsafe.Pointer(l)
+// Swap sets a value for a key. If the key is currently loading via Get, the
+// load is canceled and Get returns the value from Swap. This returns the
+// previously stored value, or the previous stale if the load errored, or the
+// previous error if there is no stale. If nothing was cached, this returns
+// Miss.
+func (c *Cache[K, V]) Swap(k K, v V) (old V, oldErr error, oldState KeyState) {
+	l := c.finalizedLoading(v)
 
-	var was unsafe.Pointer
-
-	r := c.read()
-	e, ok := r.m[k]
-
+	var was *loading[V]
 	defer func() {
 		if was == nil {
 			return
 		}
-		((*loading[V])(was)).setve(v, nil, c.cfg.newExpires(nil))
+
+		// The following block is similar to setve, but expanded to
+		// return our prior value (or stale, or err) if it exists.
+		now := now()
+		if !was.finalized() {
+			was.mu.Lock()
+			if !was.finalized() {
+				if was.stale != nil && !was.stale.expired(now) {
+					old, oldState = was.stale.v, Stale
+				}
+				was.v = v
+				was.expires.Store(c.cfg.newExpires(nil))
+				was.state.Store(stateFinalized)
+				was.wg.Done()
+				was.mu.Unlock()
+				return
+			}
+			was.mu.Unlock()
+		}
+		if expired := was.expired(now); was.err != nil || expired {
+			if was.stale != nil && !was.stale.expired(now) {
+				old, oldState = was.stale.v, Stale
+			}
+			if expired {
+				return
+			}
+		}
+		old, oldErr, oldState = was.v, was.err, Hit
 	}()
 
-	if ok {
+	r := c.read()
+	if e, ok := r.m[k]; ok {
 		for {
-			rm := atomic.LoadPointer(&e.p)
-			if rm == promotingDelete { // deleted & currently being ignored in a promote
+			rm := e.p.Load()
+			if rm != nil && rm.promotingDelete() { // deleted & currently being ignored in a promote
 				break
 			}
 			was = rm
-			if atomic.CompareAndSwapPointer(&e.p, rm, p) {
+			if e.p.CompareAndSwap(rm, l) {
 				return
 			}
 		}
@@ -410,44 +438,114 @@ func (c *Cache[K, V]) Set(k K, v V) {
 
 	c.mu.Lock()
 	r = c.read()
-	if e = r.m[k]; e != nil {
-		was = atomic.SwapPointer(&e.p, p) // was not in read, but promoted by the time we entered the lock and is now in read
+	if e := r.m[k]; e != nil {
+		was = e.p.Swap(l) // was not in read, but promoted by the time we entered the lock and is now in read
 	} else if e = c.dirty[k]; e != nil {
-		was = atomic.SwapPointer(&e.p, p)
+		was = e.p.Swap(l)
 	} else {
-		c.storeDirty(r, k, &ent[V]{p: p})
+		e := new(ent[V])
+		e.p.Store(l)
+		c.storeDirty(r, k, e)
 	}
 	c.mu.Unlock()
+	return
 }
 
 func (l *loading[V]) setve(v V, err error, expires int64) {
-	if atomic.LoadUint32(&l.state) == 1 {
+	if l.finalized() {
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.state != 0 {
+	if l.finalized() {
 		return
 	}
-	l.v, l.err, l.expires = v, err, expires
-	atomic.StoreUint32(&l.state, 1)
+	l.v, l.err = v, err
+	l.expires.Store(expires)
+	l.state.Store(stateFinalized)
 	l.wg.Done()
+}
+
+// Set sets a value for a key. If the key is currently loading via Get, the
+// load is canceled and Get returns the value from Set.
+func (c *Cache[K, V]) Set(k K, v V) {
+	c.Swap(k, v)
+}
+
+// CompareAndSwap swaps the old and new values for k if the value has finished
+// loading and the value is equal to old. The type V must be comparable.
+func (c *Cache[K, V]) CompareAndSwap(k K, old, new V) bool {
+	r := c.read()
+	if e, ok := r.m[k]; ok {
+		return c.tryCAS(e, old, new, true)
+	} else if !r.incomplete {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r = c.read()
+	if e, ok := r.m[k]; ok {
+		return c.tryCAS(e, old, new, true)
+	} else if e, ok := c.dirty[k]; ok {
+		defer c.missed(r)
+		return c.tryCAS(e, old, new, true)
+	}
+	return false
+}
+
+// CompareAndDelete deletes the entry for k if the value has finished loading
+// the the value is equal to old. The type V must be comparable.
+func (c *Cache[K, V]) CompareAndDelete(k K, old V) (deleted bool) {
+	r := c.read()
+	e, ok := r.m[k]
+	if !ok && r.incomplete {
+		c.mu.Lock()
+		r = c.read()
+		e, ok = r.m[k]
+		if !ok && r.incomplete {
+			e, ok = c.dirty[k]
+			c.missed(r)
+		}
+		c.mu.Unlock()
+	}
+	if ok {
+		return c.tryCAS(e, old, old, false)
+	}
+	return false
+}
+
+func (c *Cache[K, V]) tryCAS(e *ent[V], old, new V, useNew bool) bool {
+	l := e.p.Load()
+	if l == nil || !l.onlyFinalized() || any(l.v) != any(old) {
+		return false
+	}
+	var l2 *loading[V]
+	if useNew {
+		l2 = c.finalizedLoading(new)
+	}
+	for {
+		if e.p.CompareAndSwap(l, l2) {
+			return true
+		}
+		l = e.p.Load()
+		if l == nil || !l.onlyFinalized() || any(l.v) != any(old) {
+			return false
+		}
+	}
 }
 
 //////////////////////
 // CACHE READ/DIRTY //
 //////////////////////
 
-var promotingDelete = unsafe.Pointer(new(any))
-
 func (c *Cache[K, V]) read() read[K, V] {
-	p := atomic.LoadPointer(&c.r)
+	p := c.r.Load()
 	if p == nil {
 		return read[K, V]{}
 	}
-	return *(*read[K, V])(p)
+	return *p
 }
-func (c *Cache[K, V]) storeRead(r read[K, V]) { atomic.StorePointer(&c.r, unsafe.Pointer(&r)) }
+func (c *Cache[K, V]) storeRead(r read[K, V]) { c.r.Store(&r) }
 
 func (c *Cache[K, V]) storeDirty(r read[K, V], k K, e *ent[V]) {
 	if !r.incomplete {
@@ -487,14 +585,14 @@ func (c *Cache[K, V]) promote() {
 
 outer:
 	for k, e := range r.m {
-		p := atomic.LoadPointer(&e.p)
+		p := e.p.Load()
 		for p == nil {
-			if atomic.CompareAndSwapPointer(&e.p, nil, promotingDelete) {
+			if e.p.CompareAndSwap(nil, c.pd) {
 				continue outer
 			}
-			p = atomic.LoadPointer(&e.p) // concurrently deleted while promoting
+			p = e.p.Load() // concurrently deleted while promoting
 		}
-		if p != promotingDelete {
+		if p != c.pd {
 			keep[k] = e
 		}
 	}
@@ -504,18 +602,32 @@ outer:
 // ENT //
 /////////
 
-func (l *loading[V]) finalized() bool { return atomic.LoadUint32(&l.state) == 1 }
+func (c *Cache[K, V]) finalizedLoading(v V) *loading[V] {
+	l := &loading[V]{
+		v: v,
+	}
+	l.expires.Store(c.cfg.newExpires(nil))
+	l.state.Store(stateFinalized)
+	if c.cfg.maxStaleAge != 0 {
+		l.stale = newStale(v, now(), c.cfg.maxStaleAge)
+	}
+	return l
+}
+
+func (l *loading[V]) promotingDelete() bool { return l.state.Load() == 2 }
+func (l *loading[V]) finalized() bool       { return l.state.Load() != 0 }
+func (l *loading[V]) onlyFinalized() bool   { return l.state.Load() == 1 }
 
 func (e *ent[V]) del() {
 	if e == nil {
 		return
 	}
 	for {
-		p := atomic.LoadPointer(&e.p)
-		if p == nil || p == promotingDelete {
+		p := e.p.Load()
+		if p == nil || p.promotingDelete() {
 			return
 		}
-		if atomic.CompareAndSwapPointer(&e.p, p, nil) {
+		if e.p.CompareAndSwap(p, nil) {
 			return
 		}
 	}
@@ -525,31 +637,31 @@ func (e *ent[V]) load() *loading[V] {
 	if e == nil {
 		return nil
 	}
-	p := atomic.LoadPointer(&e.p)
-	if p == nil || p == promotingDelete {
+	p := e.p.Load()
+	if p == nil || p.promotingDelete() {
 		return nil
 	}
-	return (*loading[V])(p)
+	return p
 }
 
 func (l *loading[V]) expired(now int64) bool {
-	expires := atomic.LoadInt64(&l.expires)
+	expires := l.expires.Load()
 	return expires != 0 && expires <= now // 0 means either miss not resolved, or no max age
 }
 
 func (s *stale[V]) expired(now int64) bool {
-	expires := atomic.LoadInt64(&s.expires)
+	expires := s.expires
 	return expires != 0 && expires <= now
 }
 
 // If an entry is expiring, we create a new entry with this previous entry as
 // a stale.
 //
-//   * if entry is nil, no stale, return nil
-//   * if no stale age, we are not using stales, return nil
-//   * if entry has an error, return prior stale
-//   * if age is < 0, return new unexpiring stale
-//   * else, return new stale with prior expiry + stale age
+//   - if entry is nil, no stale, return nil
+//   - if no stale age, we are not using stales, return nil
+//   - if entry has an error, return prior stale
+//   - if age is < 0, return new unexpiring stale
+//   - else, return new stale with prior expiry + stale age
 func (e *ent[V]) maybeNewStale(age time.Duration) *stale[V] {
 	if e == nil || age == 0 {
 		return nil
@@ -561,7 +673,7 @@ func (e *ent[V]) maybeNewStale(age time.Duration) *stale[V] {
 	if l.err != nil {
 		return l.stale
 	}
-	return newStale(l.v, l.expires, age)
+	return newStale(l.v, l.expires.Load(), age)
 }
 
 // Actually returns the stale; age must be non-zero.
@@ -621,7 +733,6 @@ func (e *ent[V]) tryGet(n64 int64) (v V, err error, state KeyState) {
 	if l == nil { // deleting or promotedDelete
 		return
 	}
-
 	if n64 == 0 {
 		n64 = now()
 	}
@@ -637,13 +748,13 @@ func (e *ent[V]) tryGet(n64 int64) (v V, err error, state KeyState) {
 	}
 
 	// If we have an error or we are expired, we maybe return the stale.
-	if l.err != nil || l.expired(now) {
+	if expired := l.expired(now); l.err != nil || expired {
 		if l.stale != nil && !l.stale.expired(now) {
 			return l.stale.v, nil, Stale
 		}
-	}
-	if l.expired(now) {
-		return
+		if expired {
+			return
+		}
 	}
 	return l.v, l.err, Hit
 }
@@ -686,9 +797,9 @@ func (i *Item[V]) Get(miss func() (V, error)) (v V, err error, state KeyState) {
 }
 
 // TryGet returns the value the item if it is cached. This returns either the
-// currently loaded value, or if the current load has an error, the stale value
-// if present, or the currently stored error. If nothing is cached, or what is
-// cached is expired, this returns Miss.
+// currently loaded value, or the current stale if the load errored, or the
+// load error if there is no stale. If nothing is cached, or what is cached is
+// expired, this returns Miss.
 func (i *Item[V]) TryGet() (v V, err error, state KeyState) {
 	return i.c.TryGet(struct{}{})
 }
@@ -710,6 +821,27 @@ func (i *Item[V]) Expire() {
 // the load is canceled and Get returns the value from Set.
 func (i *Item[V]) Set(v V) {
 	i.c.Set(struct{}{}, v)
+}
+
+// Swap sets the value for the item. If the item is currently loading via Get,
+// the load is canceled and Get returns the value from Set. This returns the
+// previously stored value, or the previous stale if the load errored, or the
+// previous error if there is no stale. If nothing is cached, this returns
+// Miss.
+func (i *Item[V]) Swap(v V) (old V, oldErr error, oldState KeyState) {
+	return i.c.Swap(struct{}{}, v)
+}
+
+// CompareAndSwap swaps the old and new values if the value has finished
+// loading and the value is equal to old. The type V must be comparable.
+func (i *Item[V]) CompareAndSwap(old, new V) (swapped bool) {
+	return i.c.CompareAndSwap(struct{}{}, old, new)
+}
+
+// CompareAndDelete deletes the item if the value has finished loading the the
+// value is equal to old. The type V must be comparable.
+func (i *Item[V]) CompareAndDelete(old V) (deleted bool) {
+	return i.c.CompareAndDelete(struct{}{}, old)
 }
 
 /////////
