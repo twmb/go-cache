@@ -381,7 +381,7 @@ func (c *Cache[K, V]) StopAutoClean() {
 
 // Swap sets a value for a key. If the key is currently loading via Get, the
 // load is canceled and Get returns the value from Swap. This returns the
-// previously loaded value, or the previous stale if the load errored, or the
+// previously stored value, or the previous stale if the load errored, or the
 // previous error if there is no stale. If nothing was cached, this returns
 // Miss.
 func (c *Cache[K, V]) Swap(k K, v V) (old V, oldErr error, oldState KeyState) {
@@ -821,6 +821,27 @@ func (i *Item[V]) Expire() {
 // the load is canceled and Get returns the value from Set.
 func (i *Item[V]) Set(v V) {
 	i.c.Set(struct{}{}, v)
+}
+
+// Swap sets the value for the item. If the item is currently loading via Get,
+// the load is canceled and Get returns the value from Set. This returns the
+// previously stored value, or the previous stale if the load errored, or the
+// previous error if there is no stale. If nothing is cached, this returns
+// Miss.
+func (i *Item[V]) Swap(v V) (old V, oldErr error, oldState KeyState) {
+	return i.c.Swap(struct{}{}, v)
+}
+
+// CompareAndSwap swaps the old and new values if the value has finished
+// loading and the value is equal to old. The type V must be comparable.
+func (i *Item[V]) CompareAndSwap(old, new V) (swapped bool) {
+	return i.c.CompareAndSwap(struct{}{}, old, new)
+}
+
+// CompareAndDelete deletes the item if the value has finished loading the the
+// value is equal to old. The type V must be comparable.
+func (i *Item[V]) CompareAndDelete(old V) (deleted bool) {
+	return i.c.CompareAndDelete(struct{}{}, old)
 }
 
 /////////
