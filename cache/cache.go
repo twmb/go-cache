@@ -53,7 +53,7 @@ type (
 		err     error
 		expires atomic.Int64 // nano at which this ent is unusable, if non-zero
 		stale   *stale[V]
-		state   atomic.Uint32 // 0 == not finalized, 1 == finalized, 2 == promotingDelete
+		state   atomic.Uint32
 
 		wg sync.WaitGroup
 		mu sync.Mutex
@@ -98,6 +98,12 @@ type (
 	Opt interface {
 		apply(*cfg)
 	}
+)
+
+const (
+	stateLoading uint32 = iota
+	stateFinalized
+	statePromotingDelete
 )
 
 func now() int64 { return time.Now().UnixNano() }
@@ -166,7 +172,7 @@ func New[K comparable, V any](opts ...Opt) *Cache[K, V] {
 		cfg: cfg,
 		pd:  new(loading[V]),
 	}
-	c.pd.state.Store(2)
+	c.pd.state.Store(statePromotingDelete)
 
 	if cfg.autoCleanInterval > 0 && c.cfg.maxStaleAge >= 0 {
 		c.quitClean = make(chan struct{})
@@ -281,9 +287,9 @@ func (c *Cache[K, V]) tryLoadEnt(k K, dirty func()) *ent[V] {
 }
 
 // TryGet returns the value for the given key if it is cached. This returns
-// either the currently stored value, or if the current store has an error, the
-// stale value if present, or the currently stored error. If nothing is cached,
-// or what is cached is expired, this returns Miss.
+// either the currently stored value, or the current stale if the load errored,
+// or the load error if there is no stale. If nothing is cached, or what is
+// cached is expired, this returns Miss.
 func (c *Cache[K, V]) TryGet(k K) (V, error, KeyState) {
 	e := c.tryLoadEnt(k, nil)
 	return e.tryGet(0)
@@ -373,31 +379,56 @@ func (c *Cache[K, V]) StopAutoClean() {
 	})
 }
 
-// Set sets a value for a key. If the key is currently loading via Get, the
-// load is canceled and Get returns the value from Set.
-func (c *Cache[K, V]) Set(k K, v V) {
+// Swap sets a value for a key. If the key is currently loading via Get, the
+// load is canceled and Get returns the value from Swap. This returns the
+// previously loaded value, or the previous stale if the load errored, or the
+// previous error if there is no stale. If nothing was cached, this returns
+// Miss.
+func (c *Cache[K, V]) Swap(k K, v V) (old V, oldErr error, oldState KeyState) {
 	l := &loading[V]{
 		v: v,
 	}
 	l.expires.Store(c.cfg.newExpires(nil))
-	l.state.Store(1)
+	l.state.Store(stateFinalized)
 	if c.cfg.maxStaleAge != 0 {
 		l.stale = newStale(v, now(), c.cfg.maxStaleAge)
 	}
 
 	var was *loading[V]
-
-	r := c.read()
-	e, ok := r.m[k]
-
 	defer func() {
 		if was == nil {
 			return
 		}
-		was.setve(v, nil, c.cfg.newExpires(nil))
+
+		now := now()
+		if !was.finalized() {
+			was.mu.Lock()
+			if !was.finalized() {
+				if was.stale != nil && !was.stale.expired(now) {
+					old, oldState = was.stale.v, Stale
+				}
+				was.v = v
+				was.expires.Store(c.cfg.newExpires(nil))
+				was.state.Store(stateFinalized)
+				was.wg.Done()
+				was.mu.Unlock()
+				return
+			}
+			was.mu.Unlock()
+		}
+		if expired := was.expired(now); was.err != nil || expired {
+			if was.stale != nil && !was.stale.expired(now) {
+				old, oldState = was.stale.v, Stale
+			}
+			if expired {
+				return
+			}
+		}
+		old, oldErr, oldState = was.v, was.err, Hit
 	}()
 
-	if ok {
+	r := c.read()
+	if e, ok := r.m[k]; ok {
 		for {
 			rm := e.p.Load()
 			if rm != nil && rm.promotingDelete() { // deleted & currently being ignored in a promote
@@ -412,7 +443,7 @@ func (c *Cache[K, V]) Set(k K, v V) {
 
 	c.mu.Lock()
 	r = c.read()
-	if e = r.m[k]; e != nil {
+	if e := r.m[k]; e != nil {
 		was = e.p.Swap(l) // was not in read, but promoted by the time we entered the lock and is now in read
 	} else if e = c.dirty[k]; e != nil {
 		was = e.p.Swap(l)
@@ -422,6 +453,7 @@ func (c *Cache[K, V]) Set(k K, v V) {
 		c.storeDirty(r, k, e)
 	}
 	c.mu.Unlock()
+	return
 }
 
 func (l *loading[V]) setve(v V, err error, expires int64) {
@@ -435,8 +467,14 @@ func (l *loading[V]) setve(v V, err error, expires int64) {
 	}
 	l.v, l.err = v, err
 	l.expires.Store(expires)
-	l.state.Store(1)
+	l.state.Store(stateFinalized)
 	l.wg.Done()
+}
+
+// Set sets a value for a key. If the key is currently loading via Get, the
+// load is canceled and Get returns the value from Set.
+func (c *Cache[K, V]) Set(k K, v V) {
+	c.Swap(k, v)
 }
 
 //////////////////////
@@ -625,7 +663,6 @@ func (e *ent[V]) tryGet(n64 int64) (v V, err error, state KeyState) {
 	if l == nil { // deleting or promotedDelete
 		return
 	}
-
 	if n64 == 0 {
 		n64 = now()
 	}
@@ -641,13 +678,13 @@ func (e *ent[V]) tryGet(n64 int64) (v V, err error, state KeyState) {
 	}
 
 	// If we have an error or we are expired, we maybe return the stale.
-	if l.err != nil || l.expired(now) {
+	if expired := l.expired(now); l.err != nil || expired {
 		if l.stale != nil && !l.stale.expired(now) {
 			return l.stale.v, nil, Stale
 		}
-	}
-	if l.expired(now) {
-		return
+		if expired {
+			return
+		}
 	}
 	return l.v, l.err, Hit
 }
@@ -690,9 +727,9 @@ func (i *Item[V]) Get(miss func() (V, error)) (v V, err error, state KeyState) {
 }
 
 // TryGet returns the value the item if it is cached. This returns either the
-// currently loaded value, or if the current load has an error, the stale value
-// if present, or the currently stored error. If nothing is cached, or what is
-// cached is expired, this returns Miss.
+// currently loaded value, or the current stale if the load errored, or the
+// load error if there is no stale. If nothing is cached, or what is cached is
+// expired, this returns Miss.
 func (i *Item[V]) TryGet() (v V, err error, state KeyState) {
 	return i.c.TryGet(struct{}{})
 }
