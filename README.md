@@ -16,13 +16,17 @@ The following logical mapping can be done from `sync.Map` to `cache.Cache`
 functions:
 
 ```go
-  sync.Map.Delete         ==  cache.Cache.Delete
-  sync.Map.Get            ==  cache.Cache.TryGet
-  sync.Map.LoadAndDelete  ==  (no equivalent)
-  sync.Map.LoadOrStore    ==  cache.Cache.Get
-  sync.Map.Range          ==  cache.Cache.Range
-  sync.Map.Store          ==  cache.Cache.Set
+  sync.Map.CompareAndDelete == cache.Cache.CompareAndDelete
+  sync.Map.CompareAndSwap   == cache.Cache.CompareAndSwap
+  sync.Map.Delete           == (no equivalent -- we just provide LoadAndDelete)
+  sync.Map.Load             == cache.Cache.TryGet
+  sync.Map.LoadAndDelete    == cache.Cache.Delete
+  sync.Map.LoadOrStore      == cache.Cache.Get
+  sync.Map.Range            == cache.Cache.Range
+  sync.Map.Store            == cache.Cache.Set
+  sync.Map.Swap             == cache.Cache.Swap
 ```
+
 
 The cache has the concept of expiring values with max ages. As well, a stale
 value can be kept and returned from `Get` during a refresh / if a refresh
@@ -32,6 +36,12 @@ errors can be occasionally cleaned with `Clean`.
 Out of an abundance of paranoia that this code is correct, there are unit tests
 to hit 97% coverage of the `cache.Cache` type. As well, all tests against
 `sync.Map` are copied into this library and used against `cache.Cache`.
+
+This package also provides a cached `Item` and a `Set`. `Item` can be used to
+populate an expensive value once and expire or replace it when needed, similar
+to a singleton. `Set` can be used as a standard set for when key values are
+expensive. Functions that do not make sense on either of these types are not
+provided (e.g., `CompareAndSwap` for a `Set`).
 
 Documentation
 -------------
