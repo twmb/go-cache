@@ -242,8 +242,8 @@ func TestExpires(t *testing.T) {
 		c := New[string, string](MaxStaleAge(1))
 		c.Set("foo", "bar")
 		c.Expire("foo")
+		time.Sleep(5 * time.Nanosecond) // past max stale age
 		v, err, s := c.TryGet("foo")
-		time.Sleep(2 * time.Nanosecond) // past max stale age
 		vcheck(t, got[string]{v, err, s}, got[string]{"", nil, Miss})
 		v, err, s = c.Get("foo", func() (string, error) { return "baz", nil })
 		vcheck(t, got[string]{v, err, s}, got[string]{"baz", nil, Miss})

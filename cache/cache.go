@@ -322,7 +322,7 @@ func (c *Cache[K, V]) Delete(k K) (V, error, KeyState) {
 func (c *Cache[K, V]) Expire(k K) {
 	e := c.tryLoadEnt(k, nil)
 	if l := e.load(); l != nil && l.finalized() {
-		l.expires.Store(now())
+		l.expires.Store(now() - 1)
 	}
 }
 
