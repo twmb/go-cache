@@ -322,6 +322,7 @@ func TestExpires(t *testing.T) {
 
 	// Clean expired values.
 	{
+		var n int
 		c := New[string, string]()
 		c.Set("1", "foo")
 		c.Set("2", "foo")
@@ -335,9 +336,16 @@ func TestExpires(t *testing.T) {
 		c.Expire("1")
 		c.Expire("3")
 		c.Expire("5")
+		c.SetCleanFn(func(string) { n++ })
+		c.Clean()
 		c.Expire("7")
 		c.Expire("9")
+		c.SetCleanFn(nil)
 		c.Clean()
+
+		if n != 3 {
+			t.Errorf("got clean fn count %d != exp 3", n)
+		}
 
 		exp := map[string]bool{
 			"2": true,

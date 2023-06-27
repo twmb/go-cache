@@ -82,6 +82,7 @@ type (
 
 		quitOnce  sync.Once
 		quitClean chan struct{}
+		cleanFn   atomic.Pointer[func(V)]
 	}
 
 	cfg struct {
@@ -153,6 +154,9 @@ func MaxErrorAge(age time.Duration) Opt { return opt{fn: func(c *cfg) { c.maxErr
 // interval that is less than your MaxAge + MaxStaleAge. Values are only
 // candidates to be cleaned after the max age has elapsed. At worst, a value
 // may persist for a total of MaxAge + MaxStaleAge + AutoCleanInterval.
+//
+// If you want to run a cleanup function on deleted values, use
+// SetCleanFn.
 func AutoCleanInterval(interval time.Duration) Opt {
 	return opt{fn: func(c *cfg) { c.autoCleanInterval = interval }}
 }
@@ -190,6 +194,15 @@ func New[K comparable, V any](opts ...Opt) *Cache[K, V] {
 		}()
 	}
 	return c
+}
+
+// SetCleanFn sets a function that is called on values that are cleaned.
+func (c *Cache[K, V]) SetCleanFn(fn func(V)) {
+	if fn == nil {
+		c.cleanFn.Store(nil)
+		return
+	}
+	c.cleanFn.Store(&fn)
 }
 
 // Get returns the cache value for k, running the miss function in a goroutine
@@ -358,11 +371,18 @@ func (c *Cache[K, V]) Clean() {
 		return
 	}
 	now := now()
+	var fn func(V)
+	if pfn := c.cleanFn.Load(); pfn != nil {
+		fn = *pfn
+	}
 	c.each(func(k K, e *ent[V]) bool {
 		if l := e.load(); l != nil && l.finalized() {
 			expires := l.expires.Load()
 			if expires != 0 && now > expires+int64(c.cfg.maxStaleAge) {
-				c.Delete(k)
+				v, err, _ := c.Delete(k)
+				if err == nil && fn != nil {
+					fn(v)
+				}
 			}
 		}
 		return true
