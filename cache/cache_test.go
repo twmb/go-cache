@@ -312,8 +312,8 @@ func TestExpires(t *testing.T) {
 	}
 
 	// Errors are deleted immediately.
-	{
-		c := New[string, string](MaxErrorAge(1))
+	for _, d := range []time.Duration{-1, 0, 1} {
+		c := New[string, string](MaxErrorAge(d))
 		v, err, s := c.Get("foo", func() (string, error) { return "", errors.New("foo") })
 		vcheck(t, got[string]{v, err, s}, got[string]{"", errors.New("foo"), Miss})
 		v, err, s = c.Get("foo", func() (string, error) { return "bar", nil })
