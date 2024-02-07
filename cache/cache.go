@@ -89,6 +89,7 @@ type (
 		maxStaleAge       time.Duration
 		maxErrAge         time.Duration
 		ageSet            bool
+		errAgeSet         bool
 		autoCleanInterval time.Duration
 	}
 
@@ -109,14 +110,22 @@ const (
 func now() int64 { return time.Now().UnixNano() }
 
 func (cfg *cfg) newExpires(err error) int64 {
-	ttl := cfg.maxAge
-	if err != nil {
+	var ttl time.Duration
+	var del0 bool
+	if err != nil && cfg.errAgeSet {
 		ttl = cfg.maxErrAge
+		del0 = cfg.maxErrAge <= 0
+	} else {
+		ttl = cfg.maxAge
+		del0 = cfg.ageSet && cfg.maxAge <= 0
 	}
-	if ttl > 0 {
-		return time.Now().Add(ttl).UnixNano()
+	if del0 {
+		return -1
 	}
-	return 0
+	if ttl == 0 {
+		return 0
+	}
+	return time.Now().Add(ttl).UnixNano()
 }
 
 func (o opt) apply(c *cfg) { o.fn(c) }
@@ -145,8 +154,11 @@ func MaxAge(age time.Duration) Opt { return opt{fn: func(c *cfg) { c.maxAge, c.a
 func MaxStaleAge(age time.Duration) Opt { return opt{fn: func(c *cfg) { c.maxStaleAge = age }} }
 
 // MaxErrorAge sets the age to persist load errors. If not specified, the
-// default is MaxAge.
-func MaxErrorAge(age time.Duration) Opt { return opt{fn: func(c *cfg) { c.maxErrAge = age }} }
+// default is MaxAge. Using this option with 0 disables caching errors
+// entirely.
+func MaxErrorAge(age time.Duration) Opt {
+	return opt{fn: func(c *cfg) { c.maxErrAge, c.errAgeSet = age, true }}
+}
 
 // AutoCleanInterval begins a goroutine that calls Clean every interval. The
 // goroutine can be quit with StopAutoClean. It is recommended to use an
@@ -164,9 +176,6 @@ func New[K comparable, V any](opts ...Opt) *Cache[K, V] {
 	var cfg cfg
 	for _, opt := range opts {
 		opt.apply(&cfg)
-	}
-	if cfg.maxErrAge == 0 {
-		cfg.maxErrAge = cfg.maxAge
 	}
 	c := &Cache[K, V]{
 		cfg: cfg,
@@ -247,11 +256,6 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeySta
 	}
 	c.mu.Unlock()
 
-	// We have created a new entry: if we are configured to not cache, we
-	// clear this entry upon return.
-	if c.cfg.ageSet && c.cfg.maxAge <= 0 {
-		defer c.Delete(k)
-	}
 	go func() { v, err := miss(); l.setve(v, err, c.cfg.newExpires(err)) }()
 
 	// We could have set our own stale value which can be returned
@@ -262,6 +266,9 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeySta
 	v, err, s = e.get()
 	switch s {
 	case Miss, Hit:
+		// We always return l.v and l.err. If this expires immediately,
+		// get may return no value. We want to return at least the
+		// value generated from this miss.
 		return l.v, l.err, Miss
 	}
 	return v, err, Stale
@@ -778,9 +785,6 @@ func NewItem[V any](opts ...Opt) *Item[V] {
 	for _, opt := range opts {
 		opt.apply(&c)
 	}
-	if c.maxErrAge == 0 {
-		c.maxErrAge = c.maxAge
-	}
 	return &Item[V]{
 		c: Cache[struct{}, V]{
 			cfg: c,
@@ -862,9 +866,6 @@ func NewSet[K comparable](opts ...Opt) *Set[K] {
 	var c cfg
 	for _, opt := range opts {
 		opt.apply(&c)
-	}
-	if c.maxErrAge == 0 {
-		c.maxErrAge = c.maxAge
 	}
 	return &Set[K]{
 		c: Cache[K, struct{}]{
