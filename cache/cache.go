@@ -88,6 +88,7 @@ type (
 		maxAge            time.Duration
 		maxStaleAge       time.Duration
 		maxErrAge         time.Duration
+		maxIdleAge        time.Duration
 		ageSet            bool
 		errAgeSet         bool
 		autoCleanInterval time.Duration
@@ -117,6 +118,9 @@ func (cfg *cfg) newExpires(err error) int64 {
 		del0 = cfg.maxErrAge <= 0
 	} else {
 		ttl = cfg.maxAge
+		if ttl == 0 && !cfg.ageSet && cfg.maxIdleAge > 0 {
+			ttl = cfg.maxIdleAge
+		}
 		del0 = cfg.ageSet && cfg.maxAge <= 0
 	}
 	if del0 {
@@ -158,6 +162,14 @@ func MaxStaleAge(age time.Duration) Opt { return opt{fn: func(c *cfg) { c.maxSta
 // entirely.
 func MaxErrorAge(age time.Duration) Opt {
 	return opt{fn: func(c *cfg) { c.maxErrAge, c.errAgeSet = age, true }}
+}
+
+// MaxIdleAge opts in to extending an entry's expiry on each successful
+// access. Each time Get or TryGet returns a Hit without an error, the
+// entry's expiry is reset to now + age. If MaxAge is not set, the idle
+// age is also used as the initial TTL.
+func MaxIdleAge(age time.Duration) Opt {
+	return opt{fn: func(c *cfg) { c.maxIdleAge = age }}
 }
 
 // AutoCleanInterval begins a goroutine that calls Clean every interval. The
@@ -208,7 +220,7 @@ func New[K comparable, V any](opts ...Opt) *Cache[K, V] {
 func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeyState) {
 	r := c.read()
 	e := r.m[k]
-	if v, err, s = e.get(); s == Hit {
+	if v, err, s = e.get(c.cfg.maxIdleAge); s == Hit {
 		return v, err, s
 	}
 
@@ -217,7 +229,7 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeySta
 	c.mu.Lock()
 	r = c.read()
 	e = r.m[k]
-	if v, err, s = e.get(); s == Hit {
+	if v, err, s = e.get(c.cfg.maxIdleAge); s == Hit {
 		c.mu.Unlock()
 		return v, err, s
 	}
@@ -229,7 +241,7 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeySta
 		e = c.dirty[k]
 		c.missed(r)
 		r = c.read()
-		if v, err, s = e.get(); s == Hit {
+		if v, err, s = e.get(c.cfg.maxIdleAge); s == Hit {
 			c.mu.Unlock()
 			return v, err, s
 		}
@@ -263,7 +275,7 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeySta
 	// stale to be returned now, `get` returns it. If `get` returns a Hit,
 	// we ended up waiting for ourself and we return a miss. There should
 	// be no Miss returns from `get`.
-	v, err, s = e.get()
+	v, err, s = e.get(c.cfg.maxIdleAge)
 	switch s {
 	case Miss, Hit:
 		// We always return l.v and l.err. If this expires immediately,
@@ -299,7 +311,7 @@ func (c *Cache[K, V]) tryLoadEnt(k K, dirty func()) *ent[V] {
 // cached is expired, this returns Miss.
 func (c *Cache[K, V]) TryGet(k K) (V, error, KeyState) {
 	e := c.tryLoadEnt(k, nil)
-	return e.tryGet(0)
+	return e.tryGet(0, c.cfg.maxIdleAge)
 }
 
 // Delete deletes the value for a key and returns the prior value, if stored
@@ -307,7 +319,7 @@ func (c *Cache[K, V]) TryGet(k K) (V, error, KeyState) {
 func (c *Cache[K, V]) Delete(k K) (V, error, KeyState) {
 	e := c.tryLoadEnt(k, func() { delete(c.dirty, k) })
 	defer e.del()
-	return e.tryGet(0)
+	return e.tryGet(0, 0)
 }
 
 // Expire sets a stored value to expire immediately, meaning the next Get will
@@ -326,7 +338,7 @@ func (c *Cache[K, V]) Range(fn func(K, V, error) bool) {
 	// current time when we enter range and avoid it in all tryGet calls.
 	now := now()
 	c.each(func(k K, e *ent[V]) bool {
-		v, err, s := e.tryGet(now)
+		v, err, s := e.tryGet(now, 0)
 		if s.IsMiss() {
 			return true
 		}
@@ -706,7 +718,7 @@ func newStale[V any](v V, expires int64, age time.Duration) *stale[V] {
 // get always returns the value or the stale value. We do not check if our
 // value is expired: we call this at the end of Get, we must always return
 // something even if it is to be immediately expired.
-func (e *ent[V]) get() (v V, err error, state KeyState) {
+func (e *ent[V]) get(extend time.Duration) (v V, err error, state KeyState) {
 	l := e.load()
 	var waited bool
 	if l == nil {
@@ -741,10 +753,13 @@ func (e *ent[V]) get() (v V, err error, state KeyState) {
 		}
 		return v, err, state
 	}
+	if extend > 0 && l.err == nil {
+		l.expires.Store(now + int64(extend))
+	}
 	return l.v, l.err, Hit
 }
 
-func (e *ent[V]) tryGet(n64 int64) (v V, err error, state KeyState) {
+func (e *ent[V]) tryGet(n64 int64, extend time.Duration) (v V, err error, state KeyState) {
 	if e == nil {
 		return v, err, state
 	}
@@ -778,6 +793,9 @@ func (e *ent[V]) tryGet(n64 int64) (v V, err error, state KeyState) {
 		if expired {
 			return v, err, state
 		}
+	}
+	if extend > 0 && l.err == nil {
+		l.expires.Store(now + int64(extend))
 	}
 	return l.v, l.err, Hit
 }
