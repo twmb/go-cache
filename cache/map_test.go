@@ -25,6 +25,7 @@ const (
 	opSwap             = mapOp("Swap")
 	opCompareAndSwap   = mapOp("CompareAndSwap")
 	opCompareAndDelete = mapOp("CompareAndDelete")
+	opClear            = mapOp("Clear")
 )
 
 var mapOps = [...]mapOp{
@@ -36,6 +37,7 @@ var mapOps = [...]mapOp{
 	opSwap,
 	opCompareAndSwap,
 	opCompareAndDelete,
+	opClear,
 }
 
 // mapCall is a quick.Generator for calls on mapInterface.
@@ -73,6 +75,9 @@ func (c mapCall) apply(m mapInterface[string]) (any, bool) {
 				return nil, true
 			}
 		}
+		return nil, false
+	case opClear:
+		m.Clear()
 		return nil, false
 	default:
 		panic("invalid mapOp")

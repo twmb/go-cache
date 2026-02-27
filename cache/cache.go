@@ -209,7 +209,7 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeySta
 	r := c.read()
 	e := r.m[k]
 	if v, err, s = e.get(); s == Hit {
-		return
+		return v, err, s
 	}
 
 	// We missed in the read map. We lock and check again to guard against
@@ -219,7 +219,7 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeySta
 	e = r.m[k]
 	if v, err, s = e.get(); s == Hit {
 		c.mu.Unlock()
-		return
+		return v, err, s
 	}
 
 	// We could have an entry in our read map that was deleted and has not
@@ -231,7 +231,7 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeySta
 		r = c.read()
 		if v, err, s = e.get(); s == Hit {
 			c.mu.Unlock()
-			return
+			return v, err, s
 		}
 	}
 
@@ -376,6 +376,15 @@ func (c *Cache[K, V]) Clean() {
 	})
 }
 
+// Clear deletes all keys from the cache, resetting it to an empty state.
+func (c *Cache[K, V]) Clear() {
+	c.mu.Lock()
+	c.dirty = nil
+	c.storeRead(read[K, V]{})
+	c.misses = 0
+	c.mu.Unlock()
+}
+
 // StopAutoClean stops the auto clean goroutine that is began with the
 // AutoClean option.
 func (c *Cache[K, V]) StopAutoClean() {
@@ -438,7 +447,7 @@ func (c *Cache[K, V]) Swap(k K, v V) (old V, oldErr error, oldState KeyState) {
 			}
 			was = rm
 			if e.p.CompareAndSwap(rm, l) {
-				return
+				return old, oldErr, oldState
 			}
 		}
 	}
@@ -455,7 +464,7 @@ func (c *Cache[K, V]) Swap(k K, v V) (old V, oldErr error, oldState KeyState) {
 		c.storeDirty(r, k, e)
 	}
 	c.mu.Unlock()
-	return
+	return old, oldErr, oldState
 }
 
 func (l *loading[V]) setve(v V, err error, expires int64) {
@@ -501,7 +510,7 @@ func (c *Cache[K, V]) CompareAndSwap(k K, old, new V) bool {
 }
 
 // CompareAndDelete deletes the entry for k if the value has finished loading
-// the the value is equal to old. The type V must be comparable.
+// and the value is equal to old. The type V must be comparable.
 func (c *Cache[K, V]) CompareAndDelete(k K, old V) (deleted bool) {
 	r := c.read()
 	e, ok := r.m[k]
@@ -613,11 +622,14 @@ func (c *Cache[K, V]) finalizedLoading(v V) *loading[V] {
 	l := &loading[V]{
 		v: v,
 	}
-	l.expires.Store(c.cfg.newExpires(nil))
-	l.state.Store(stateFinalized)
-	if c.cfg.maxStaleAge != 0 {
-		l.stale = newStale(v, now(), c.cfg.maxStaleAge)
+	expires := c.cfg.newExpires(nil)
+	if expires != 0 || c.cfg.maxStaleAge != 0 {
+		l.expires.Store(expires)
+		if c.cfg.maxStaleAge != 0 {
+			l.stale = newStale(v, l.expires.Load(), c.cfg.maxStaleAge)
+		}
 	}
+	l.state.Store(stateFinalized)
 	return l
 }
 
@@ -700,7 +712,7 @@ func (e *ent[V]) get() (v V, err error, state KeyState) {
 	if l == nil {
 		// Could be nil if deleted while in the read map, or
 		// promotingDelete.
-		return
+		return v, err, state
 	}
 	if !l.finalized() {
 		if l.stale != nil && !l.stale.expired(now()) {
@@ -718,7 +730,7 @@ func (e *ent[V]) get() (v V, err error, state KeyState) {
 	// if the user is configured to never cache and they're just using
 	// request collapsing: we still want to return the now expired value.
 	now := now()
-	if !waited && l.expired(now) || l.err != nil {
+	if (!waited && l.expired(now)) || l.err != nil {
 		if l.stale != nil && !l.stale.expired(now) {
 			return l.stale.v, nil, Stale
 		}
@@ -727,18 +739,22 @@ func (e *ent[V]) get() (v V, err error, state KeyState) {
 		if !l.expired(now) {
 			return l.v, l.err, Hit
 		}
-		return
+		return v, err, state
 	}
 	return l.v, l.err, Hit
 }
 
 func (e *ent[V]) tryGet(n64 int64) (v V, err error, state KeyState) {
 	if e == nil {
-		return
+		return v, err, state
 	}
 	l := e.load()
 	if l == nil { // deleting or promotedDelete
-		return
+		return v, err, state
+	}
+	// Fast path: finalized, no expiry, no error — skip time checks.
+	if l.onlyFinalized() && l.expires.Load() == 0 && l.err == nil {
+		return l.v, nil, Hit
 	}
 	if n64 == 0 {
 		n64 = now()
@@ -751,7 +767,7 @@ func (e *ent[V]) tryGet(n64 int64) (v V, err error, state KeyState) {
 		if l.stale != nil && !l.stale.expired(now) {
 			return l.stale.v, nil, Stale
 		}
-		return
+		return v, err, state
 	}
 
 	// If we have an error or we are expired, we maybe return the stale.
@@ -760,7 +776,7 @@ func (e *ent[V]) tryGet(n64 int64) (v V, err error, state KeyState) {
 			return l.stale.v, nil, Stale
 		}
 		if expired {
-			return
+			return v, err, state
 		}
 	}
 	return l.v, l.err, Hit
@@ -842,10 +858,15 @@ func (i *Item[V]) CompareAndSwap(old, new V) (swapped bool) {
 	return i.c.CompareAndSwap(struct{}{}, old, new)
 }
 
-// CompareAndDelete deletes the item if the value has finished loading the the
+// CompareAndDelete deletes the item if the value has finished loading and the
 // value is equal to old. The type V must be comparable.
 func (i *Item[V]) CompareAndDelete(old V) (deleted bool) {
 	return i.c.CompareAndDelete(struct{}{}, old)
+}
+
+// Clear deletes the cached item, resetting the item to an empty state.
+func (i *Item[V]) Clear() {
+	i.c.Clear()
 }
 
 /////////
@@ -927,6 +948,11 @@ func (s *Set[K]) Clean() {
 // the load is canceled and Get returns nil.
 func (s *Set[K]) Set(k K) {
 	s.c.Set(k, struct{}{})
+}
+
+// Clear deletes all keys from the set, resetting it to an empty state.
+func (s *Set[K]) Clear() {
+	s.c.Clear()
 }
 
 // StopAutoClean stops the auto clean goroutine that is began with the

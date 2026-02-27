@@ -16,6 +16,7 @@ The following logical mapping can be done from `sync.Map` to `cache.Cache`
 functions:
 
 ```go
+  sync.Map.Clear            == cache.Cache.Clear
   sync.Map.CompareAndDelete == cache.Cache.CompareAndDelete
   sync.Map.CompareAndSwap   == cache.Cache.CompareAndSwap
   sync.Map.Delete           == (no equivalent -- we just provide LoadAndDelete)
