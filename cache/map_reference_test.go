@@ -20,6 +20,7 @@ type mapInterface[K comparable] interface {
 	Swap(key K, value any) (previous any, loaded bool)
 	CompareAndSwap(key K, old, new any) (swapped bool)
 	CompareAndDelete(key K, old any) (deleted bool)
+	Clear()
 	Range(func(key K, value any) (shouldContinue bool))
 }
 
@@ -33,7 +34,7 @@ func (m *RWMutexMap[K]) Load(key K) (value any, ok bool) {
 	m.mu.RLock()
 	value, ok = m.dirty[key]
 	m.mu.RUnlock()
-	return
+	return value, ok
 }
 
 func (m *RWMutexMap[K]) Store(key K, value any) {
@@ -68,7 +69,7 @@ func (m *RWMutexMap[K]) Swap(key K, value any) (previous any, loaded bool) {
 	previous, loaded = m.dirty[key]
 	m.dirty[key] = value
 	m.mu.Unlock()
-	return
+	return previous, loaded
 }
 
 func (m *RWMutexMap[K]) LoadAndDelete(key K) (value any, loaded bool) {
@@ -86,6 +87,12 @@ func (m *RWMutexMap[K]) LoadAndDelete(key K) (value any, loaded bool) {
 func (m *RWMutexMap[K]) Delete(key K) {
 	m.mu.Lock()
 	delete(m.dirty, key)
+	m.mu.Unlock()
+}
+
+func (m *RWMutexMap[K]) Clear() {
+	m.mu.Lock()
+	m.dirty = nil
 	m.mu.Unlock()
 }
 
@@ -175,6 +182,10 @@ func (c *CacheMap[K]) CompareAndSwap(key K, old, new any) (swapped bool) {
 
 func (c *CacheMap[K]) CompareAndDelete(key K, old any) (deleted bool) {
 	return c.c.CompareAndDelete(key, old)
+}
+
+func (c *CacheMap[K]) Clear() {
+	c.c.Clear()
 }
 
 func (c *CacheMap[K]) Delete(key K) {

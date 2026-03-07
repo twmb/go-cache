@@ -363,3 +363,77 @@ func TestExpires(t *testing.T) {
 		}
 	}
 }
+
+func TestMaxIdleAge(t *testing.T) {
+	// MaxIdleAge alone: entry stays alive while accessed within the window,
+	// expires after inactivity.
+	t.Run("alone", func(t *testing.T) {
+		c := New[string, string](MaxIdleAge(50 * time.Millisecond))
+		c.Get("foo", func() (string, error) { return "bar", nil })
+		time.Sleep(10 * time.Millisecond)
+
+		// Access within the idle window — should still be a hit and extend.
+		for i := 0; i < 5; i++ {
+			v, err, s := c.TryGet("foo")
+			vcheck(t, got[string]{v, err, s}, got[string]{"bar", nil, Hit})
+			time.Sleep(30 * time.Millisecond) // each access resets the 50ms idle
+		}
+
+		// Now stop accessing. After 50ms of inactivity, it should expire.
+		time.Sleep(60 * time.Millisecond)
+		v, err, s := c.TryGet("foo")
+		vcheck(t, got[string]{v, err, s}, got[string]{"", nil, Miss})
+	})
+
+	// MaxIdleAge + MaxAge: initial expiry uses MaxAge, subsequent accesses
+	// extend using MaxIdleAge.
+	t.Run("with_max_age", func(t *testing.T) {
+		c := New[string, string](MaxAge(50*time.Millisecond), MaxIdleAge(50*time.Millisecond))
+		c.Get("foo", func() (string, error) { return "bar", nil })
+
+		// Keep alive well past the original MaxAge.
+		for i := 0; i < 5; i++ {
+			time.Sleep(30 * time.Millisecond)
+			v, err, s := c.Get("foo", func() (string, error) { return "baz", nil })
+			vcheck(t, got[string]{v, err, s}, got[string]{"bar", nil, Hit})
+		}
+
+		// Stop accessing, should expire.
+		time.Sleep(60 * time.Millisecond)
+		v, err, s := c.TryGet("foo")
+		vcheck(t, got[string]{v, err, s}, got[string]{"", nil, Miss})
+	})
+
+	// MaxIdleAge doesn't extend errors.
+	t.Run("no_extend_errors", func(t *testing.T) {
+		c := New[string, string](MaxAge(50*time.Millisecond), MaxIdleAge(50*time.Millisecond))
+		c.Get("foo", func() (string, error) { return "", errors.New("err") })
+		time.Sleep(10 * time.Millisecond)
+
+		// Access the errored entry — it should not be extended.
+		v, err, s := c.TryGet("foo")
+		vcheck(t, got[string]{v, err, s}, got[string]{"", errors.New("err"), Hit})
+
+		// Wait past expiry — should be gone.
+		time.Sleep(50 * time.Millisecond)
+		v, err, s = c.TryGet("foo")
+		vcheck(t, got[string]{v, err, s}, got[string]{"", nil, Miss})
+	})
+
+	// Range doesn't extend.
+	t.Run("range_no_extend", func(t *testing.T) {
+		c := New[string, string](MaxAge(50*time.Millisecond), MaxIdleAge(50*time.Millisecond))
+		c.Get("foo", func() (string, error) { return "bar", nil })
+
+		// Range over entries repeatedly — should NOT extend expiry.
+		for i := 0; i < 3; i++ {
+			time.Sleep(20 * time.Millisecond)
+			c.Range(func(string, string, error) bool { return true })
+		}
+
+		// Should be expired by now (>50ms since creation, range didn't extend).
+		time.Sleep(20 * time.Millisecond)
+		v, err, s := c.TryGet("foo")
+		vcheck(t, got[string]{v, err, s}, got[string]{"", nil, Miss})
+	})
+}
