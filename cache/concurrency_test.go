@@ -18,54 +18,43 @@ func TestSwap_CancelsInFlightGet(t *testing.T) {
 	c := New[string, int]()
 	missStart := make(chan struct{})
 	missRelease := make(chan struct{})
-	var missReturned int32
+	missDone := make(chan struct{})
 
 	var getV int
-	var getS KeyState
 	var getDone sync.WaitGroup
 	getDone.Add(1)
 	go func() {
 		defer getDone.Done()
-		v, _, s := c.Get("k", func() (int, error) {
+		v, _, _ := c.Get("k", func() (int, error) {
 			close(missStart)
 			<-missRelease
-			atomic.StoreInt32(&missReturned, 1)
+			close(missDone)
 			return 99, nil
 		})
-		getV, getS = v, s
+		getV = v
 	}()
 
 	<-missStart // miss function has begun
 
 	// Swap while the miss is still running.
-	old, _, oldS := c.Swap("k", 7)
-	// The entry was loading; there is no prior value to return, so Swap
-	// returns zero/Miss.
+	_, _, oldS := c.Swap("k", 7)
 	if oldS != Miss {
 		t.Fatalf("Swap old state: got %v want Miss", oldS)
 	}
-	_ = old
 
 	// Let the miss function finish. Its value MUST be discarded.
 	close(missRelease)
-	getDone.Wait()
+	<-missDone     // ensure the miss goroutine actually ran to completion
+	getDone.Wait() // ensure the Get goroutine returned
 
-	// Get waited on the (now-finalized-by-Swap) loading and saw Swap's value.
 	if getV != 7 {
 		t.Fatalf("Get value = %d, want 7 (Swap should cancel miss)", getV)
 	}
-	// The state observed by the Get caller is Miss because from their
-	// perspective it was a miss (they supplied the miss fn). The value is
-	// what Swap finalized.
-	_ = getS
 
 	// Verify the cache holds Swap's value, not the miss's.
 	v, _, s := c.TryGet("k")
 	if v != 7 || !s.IsHit() {
 		t.Fatalf("TryGet after Swap: v=%d s=%v, want 7 Hit", v, s)
-	}
-	if atomic.LoadInt32(&missReturned) != 1 {
-		t.Fatal("miss function never returned")
 	}
 }
 
