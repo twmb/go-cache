@@ -16,6 +16,7 @@
 package cache
 
 import (
+	"maps"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -325,6 +326,10 @@ func (c *Cache[K, V]) Delete(k K) (V, error, KeyState) {
 // Expire sets a stored value to expire immediately, meaning the next Get will
 // be a miss. If stale values are enabled, the next Get will trigger the miss
 // function but still allow the now-stale value to be returned.
+//
+// Expire only affects entries that have finished loading. Calling Expire for a
+// key whose miss function is still running is a no-op; the in-flight load will
+// complete with its normal TTL and is not canceled or shortened.
 func (c *Cache[K, V]) Expire(k K) {
 	e := c.tryLoadEnt(k, nil)
 	if l := e.load(); l != nil && l.finalized() {
@@ -377,11 +382,15 @@ func (c *Cache[K, V]) Clean() {
 		return
 	}
 	now := now()
-	c.each(func(k K, e *ent[V]) bool {
+	c.each(func(_ K, e *ent[V]) bool {
 		if l := e.load(); l != nil && l.finalized() {
 			expires := l.expires.Load()
 			if expires != 0 && now > expires+int64(c.cfg.maxStaleAge) {
-				c.Delete(k)
+				// c.each promotes when necessary, so every entry
+				// we see lives in the read map. e.del alone is
+				// sufficient; no dirty bookkeeping or per-key
+				// relock is required.
+				e.del()
 			}
 		}
 		return true
@@ -606,9 +615,7 @@ func (c *Cache[K, V]) promote() {
 	}
 
 	keep = make(map[K]*ent[V], len(keep)+len(c.dirty))
-	for k, e := range c.dirty {
-		keep[k] = e
-	}
+	maps.Copy(keep, c.dirty)
 	c.dirty = nil
 
 outer:
@@ -708,9 +715,17 @@ func (e *ent[V]) maybeNewStale(age time.Duration) *stale[V] {
 }
 
 // Actually returns the stale; age must be non-zero.
+//
+// expires is the main entry's expiry nano. If it is <= 0 (either 0 meaning
+// the main entry never expires, or -1 meaning it expired immediately), we
+// base the stale's lifespan on now so the stale is not born expired at the
+// Unix epoch.
 func newStale[V any](v V, expires int64, age time.Duration) *stale[V] {
 	if age < 0 {
 		return &stale[V]{v: v}
+	}
+	if expires <= 0 {
+		expires = now()
 	}
 	return &stale[V]{v, expires + int64(age)}
 }
@@ -851,6 +866,10 @@ func (i *Item[V]) Delete() (V, error, KeyState) {
 // Expire sets the item to expire immediately, meaning the next call to Get
 // will be a miss. If stale values are enabled, the next Get will trigger the
 // miss function but still allow the now-stale value to be returned.
+//
+// Expire only affects an item that has finished loading. Calling Expire while
+// the miss function is still running is a no-op; the in-flight load will
+// complete with its normal TTL and is not canceled or shortened.
 func (i *Item[V]) Expire() {
 	i.c.Expire(struct{}{})
 }
@@ -943,6 +962,10 @@ func (s *Set[K]) Delete(k K) (error, KeyState) {
 // Expire sets the key to expire immediately, meaning the next call to Get will
 // be a miss. If stale keys are enabled, the next Get will trigger the miss
 // function but still allow a now-stale nil error to be returned.
+//
+// Expire only affects a key whose load has finished. Calling Expire while the
+// miss function is still running is a no-op; the in-flight load will complete
+// with its normal TTL and is not canceled or shortened.
 func (s *Set[K]) Expire(k K) {
 	s.c.Expire(k)
 }
