@@ -244,6 +244,103 @@ func TestCollapsing_NoCaching(t *testing.T) {
 	}
 }
 
+// TestGet_StaleRefreshCASRace pounds on the Get slow-path CAS-retry that
+// replaces a finalized-expired-with-stale loading with a fresh loading
+// whose stale is a snapshot of the old value. Many concurrent Gets on the
+// same key force CAS losses and thus exercise the retry.
+func TestGet_StaleRefreshCASRace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stress test in -short")
+	}
+	for range 200 {
+		c := New[string, int](
+			MaxAge(time.Microsecond),
+			MaxStaleAge(time.Hour),
+		)
+		c.Set("k", 1)
+		time.Sleep(time.Millisecond) // entry expired, stale valid
+
+		const workers = 16
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for range workers {
+			go func() {
+				defer wg.Done()
+				c.Get("k", func() (int, error) {
+					// Slow miss so concurrent Gets all pile into the
+					// slow-path stale branch before any finalizes.
+					time.Sleep(time.Millisecond)
+					return 2, nil
+				})
+			}()
+		}
+		wg.Wait()
+	}
+}
+
+// TestGet_ConcurrentStaleDuringInFlight exercises Get's slow-path branch
+// where a second Get observes a stale-returning loading that is already
+// in flight from the first Get. The second Get must return the stale
+// without attempting to install a new loading.
+func TestGet_ConcurrentStaleDuringInFlight(t *testing.T) {
+	c := New[string, int](
+		MaxAge(time.Millisecond),
+		MaxStaleAge(time.Hour),
+	)
+	c.Set("k", 1)
+	time.Sleep(10 * time.Millisecond) // entry now expired, stale still valid
+
+	missRelease := make(chan struct{})
+	missStart := make(chan struct{})
+	var aDone sync.WaitGroup
+	aDone.Add(1)
+	go func() {
+		defer aDone.Done()
+		c.Get("k", func() (int, error) {
+			close(missStart)
+			<-missRelease
+			return 2, nil
+		})
+	}()
+	<-missStart
+
+	// Second Get observes the first Get's in-flight loading and its stale.
+	v, _, s := c.Get("k", func() (int, error) {
+		t.Error("second Get's miss function should not run while first Get is in flight")
+		return 3, nil
+	})
+	if s != Stale || v != 1 {
+		t.Fatalf("second Get: v=%d s=%v, want v=1 Stale", v, s)
+	}
+
+	close(missRelease)
+	aDone.Wait()
+}
+
+// TestClean_SkipsInFlightLoads verifies Clean leaves pending loads alone.
+// An entry whose loading hasn't finalized yet has no expiry to evaluate;
+// Clean must skip it.
+func TestClean_SkipsInFlightLoads(t *testing.T) {
+	c := New[string, int](MaxAge(time.Nanosecond))
+	missRelease := make(chan struct{})
+	missStarted := make(chan struct{})
+	getDone := make(chan struct{})
+	go func() {
+		defer close(getDone)
+		c.Get("k", func() (int, error) {
+			close(missStarted)
+			<-missRelease
+			return 42, nil
+		})
+	}()
+	<-missStarted
+	// The entry exists in the trie with an in-flight loading. Clean must
+	// observe !l.finalized() and skip.
+	c.Clean()
+	close(missRelease)
+	<-getDone
+}
+
 // TestCleanUnderConcurrency stresses Clean racing with concurrent
 // Set/Get/Delete to catch races in the clean path. Correctness here is that
 // the test finishes without -race complaints or panics; we also assert that

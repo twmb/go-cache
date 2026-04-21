@@ -526,6 +526,51 @@ func TestTrie_DeleteRaceRetries(t *testing.T) {
 	}
 }
 
+// TestTrie_DeleteRaceAgainstExpand targets deleteEntryIf's "slot changed to
+// non-entry after lock" branch. An indirect-node split (expand) during the
+// window between delete's unlocked walk and its parent.Lock forces the
+// reload to see a non-entry node.
+//
+// We use a controlled hashFn that collides a few keys in the top bits but
+// not all bits, so inserting them triggers expand. Concurrent insert+delete
+// races through the expand window.
+func TestTrie_DeleteRaceAgainstExpand(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stress test in -short")
+	}
+	// Keys whose hashes match in the top 4 bits but diverge later: they
+	// share a slot at depth 1 and a leaf at depth 2 (via overflow then
+	// expand).
+	hashes := map[string]uintptr{
+		"a": 0xA000000000000000,
+		"b": 0xA000000000000001,
+		"c": 0xA000000000000002,
+		"d": 0xB000000000000000,
+	}
+	for range 500 {
+		var tr trie[string, int]
+		tr.hashFn = func(k string) uintptr { return hashes[k] }
+		triePut(&tr, "a", 1)
+		triePut(&tr, "d", 4)
+
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			triePut(&tr, "b", 2)
+		}()
+		go func() {
+			defer wg.Done()
+			triePut(&tr, "c", 3)
+		}()
+		go func() {
+			defer wg.Done()
+			tr.deleteEntry("a")
+		}()
+		wg.Wait()
+	}
+}
+
 // TestTrie_DeleteDuringConcurrentStore: a goroutine repeatedly deletes key
 // K while another repeatedly stores it. Both succeed; the final state is
 // "either present or absent" and neither crashes.

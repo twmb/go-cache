@@ -285,6 +285,18 @@ func (t *trie[K, V]) expand(oldEntry, newEntry *trieEntry[K, V], newHash uintptr
 // deleteEntry removes the entry for k from the trie. Returns the removed
 // entry (or nil). Empty interior ancestors are pruned bottom-up.
 func (t *trie[K, V]) deleteEntry(k K) *trieEntry[K, V] {
+	return t.deleteEntryIf(k, nil)
+}
+
+// deleteEntryIf is like deleteEntry, but only proceeds if pred(entry)
+// returns true when evaluated under the parent's lock. This lets callers
+// guard against racing resurrections: for example, Clean wants to
+// physically remove an entry whose value slot is nil, but only if the slot
+// is still nil at the moment the lock is acquired (a concurrent Swap may
+// have CAS'd a fresh loading in since Clean's initial walk observed nil).
+//
+// If pred is nil, deleteEntryIf is equivalent to unconditional deletion.
+func (t *trie[K, V]) deleteEntryIf(k K, pred func(*trieEntry[K, V]) bool) *trieEntry[K, V] {
 	if !t.inited.Load() {
 		return nil
 	}
@@ -330,18 +342,48 @@ func (t *trie[K, V]) deleteEntry(k K) *trieEntry[K, V] {
 		break
 	}
 
-	// Under i.mu, remove k from the overflow chain. If k was the head and
-	// had no overflow, slot becomes nil; otherwise slot gets the new head.
+	// Under i.mu, locate the entry matching k in the overflow chain, call
+	// pred, and unlink in one pass. Because we pre-locate the target before
+	// calling pred, the subsequent removal cannot fail to find k.
 	head := n.entry()
-	removed, newHead, found := trieRemoveFromChain(head, k)
-	if !found {
+	var (
+		target  *trieEntry[K, V]
+		prev    *trieEntry[K, V] // non-nil when target is not the head
+		newHead *trieEntry[K, V] // chain after removal, nil if slot becomes empty
+	)
+	if head.key == k {
+		target = head
+	} else {
+		prev = head
+		for {
+			next := prev.overflow.Load()
+			if next == nil {
+				// k is not in the chain.
+				i.mu.Unlock()
+				return nil
+			}
+			if next.key == k {
+				target = next
+				break
+			}
+			prev = next
+		}
+	}
+	if pred != nil && !pred(target) {
 		i.mu.Unlock()
 		return nil
+	}
+	if prev == nil {
+		// Removing head.
+		newHead = target.overflow.Load()
+	} else {
+		prev.overflow.Store(target.overflow.Load())
+		newHead = head
 	}
 	if newHead != nil {
 		slot.Store(&newHead.trieNode)
 		i.mu.Unlock()
-		return removed
+		return target
 	}
 	slot.Store(nil)
 
@@ -364,29 +406,7 @@ func (t *trie[K, V]) deleteEntry(k K) *trieEntry[K, V] {
 		i = parent
 	}
 	i.mu.Unlock()
-	return removed
-}
-
-// trieRemoveFromChain walks the overflow chain starting at head, removes
-// the entry whose key equals k, and returns the removed entry, the new
-// chain head (which may be nil if the only entry was the head), and
-// whether an entry was actually removed.
-func trieRemoveFromChain[K comparable, V any](head *trieEntry[K, V], k K) (removed, newHead *trieEntry[K, V], found bool) {
-	if head.key == k {
-		return head, head.overflow.Load(), true
-	}
-	prev := head
-	for {
-		next := prev.overflow.Load()
-		if next == nil {
-			return nil, head, false
-		}
-		if next.key == k {
-			prev.overflow.Store(next.overflow.Load())
-			return next, head, true
-		}
-		prev = next
-	}
+	return target
 }
 
 // walk iterates every entry in the trie, calling f for each. If f returns
