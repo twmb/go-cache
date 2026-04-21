@@ -282,6 +282,14 @@ func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeySta
 		// We always return l.v and l.err. If this expires immediately,
 		// get may return no value. We want to return at least the
 		// value generated from this miss.
+		//
+		// If e.get above waited on a different loading (because a
+		// concurrent Swap/Set replaced e.p while we were racing), our
+		// l.v may still be unsynchronized with whoever called l.wg.Done
+		// — either the miss goroutine's setve or Swap's defer block,
+		// both of which write l.v before calling Done. Waiting on
+		// l.wg here provides the happens-before edge we need.
+		l.wg.Wait()
 		return l.v, l.err, Miss
 	}
 	return v, err, Stale
