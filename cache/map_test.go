@@ -276,3 +276,76 @@ func TestCompareAndSwap_NonExistingKey(t *testing.T) {
 		t.Fatalf("CompareAndSwap on an non-existing key succeeded")
 	}
 }
+
+// TestConcurrentClear — adapted from sync/map_test.go. Spawns 10 writers,
+// 10 readers, and 10 Clear goroutines; correctness is that nothing panics
+// or trips the race detector.
+func TestConcurrentClear(t *testing.T) {
+	var m CacheMap[int]
+
+	var wg sync.WaitGroup
+	wg.Add(30)
+
+	for i := range 10 {
+		go func(k, v int) {
+			defer wg.Done()
+			m.Store(k, v)
+		}(i, i*10)
+	}
+	for i := range 10 {
+		go func(k int) {
+			defer wg.Done()
+			if _, ok := m.Load(k); ok {
+				_ = ok
+			}
+		}(i)
+	}
+	for range 10 {
+		go func() {
+			defer wg.Done()
+			m.Clear()
+		}()
+	}
+
+	wg.Wait()
+
+	// After all Clears and Stores have run, the map may be empty or contain a
+	// subset of the Stores depending on interleaving. Verify no phantom keys
+	// (keys we never Stored) materialized.
+	m.Range(func(k int, _ any) bool {
+		if k < 0 || k >= 10 {
+			t.Errorf("Range after concurrent Clear/Store saw key %d, never Stored", k)
+		}
+		return true
+	})
+}
+
+// TestMapClearOneAllocation — adapted from sync/map_test.go. Cache.Clear
+// replaces the trie root with one fresh indirect node, which should be the
+// only allocation.
+func TestMapClearOneAllocation(t *testing.T) {
+	var m CacheMap[int]
+	// Prime so the trie has been initialized; Clear of an uninitialized
+	// trie still calls init which allocates more.
+	m.Store(0, 0)
+	allocs := testing.AllocsPerRun(10, func() {
+		m.Clear()
+	})
+	if allocs > 1 {
+		t.Errorf("AllocsPerRun of Clear = %v; want 1", allocs)
+	}
+}
+
+// TestMapRangeNoAllocations — adapted from sync/map_test.go. Range must not
+// allocate.
+func TestMapRangeNoAllocations(t *testing.T) {
+	var m CacheMap[int]
+	allocs := testing.AllocsPerRun(10, func() {
+		m.Range(func(k int, _ any) bool {
+			return true
+		})
+	})
+	if allocs > 0 {
+		t.Errorf("AllocsPerRun of Range = %v; want 0", allocs)
+	}
+}
