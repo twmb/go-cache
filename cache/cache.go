@@ -177,18 +177,25 @@ func AutoCleanInterval(interval time.Duration) Opt {
 // semantics. If you do not need to configure a cache at all, the zero value
 // cache is valid and usable.
 func New[K comparable, V any](opts ...Opt) *Cache[K, V] {
-	var cfg cfg
+	c := new(Cache[K, V])
+	initCache(c, opts...)
+	return c
+}
+
+// initCache applies options and starts the autoclean goroutine if
+// configured. It initializes in place (rather than returning a new cache)
+// so that NewItem and NewSet can initialize their embedded Cache: the
+// autoclean goroutine closes over c, so the configured cache cannot be
+// copied after this returns.
+func initCache[K comparable, V any](c *Cache[K, V], opts ...Opt) {
 	for _, opt := range opts {
-		opt.apply(&cfg)
-	}
-	c := &Cache[K, V]{
-		cfg: cfg,
+		opt.apply(&c.cfg)
 	}
 
-	if cfg.autoCleanInterval > 0 && c.cfg.maxStaleAge >= 0 {
+	if c.cfg.autoCleanInterval > 0 && c.cfg.maxStaleAge >= 0 {
 		c.quitClean = make(chan struct{})
 		go func() {
-			ticker := time.NewTicker(cfg.autoCleanInterval)
+			ticker := time.NewTicker(c.cfg.autoCleanInterval)
 			defer ticker.Stop()
 			for {
 				select {
@@ -200,7 +207,6 @@ func New[K comparable, V any](opts ...Opt) *Cache[K, V] {
 			}
 		}()
 	}
-	return c
 }
 
 // Get returns the cache value for k, running the miss function in a goroutine
@@ -210,74 +216,65 @@ func New[K comparable, V any](opts ...Opt) *Cache[K, V] {
 func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeyState) {
 	// Fast path: if the entry already exists and holds a live value, use
 	// it without any locking.
-	if e := c.t.loadEntry(k); e != nil {
+	e := c.t.loadEntry(k)
+	if e != nil {
 		if v, err, s = entGet(e, c.cfg.maxIdleAge); s == Hit {
 			return v, err, s
 		}
 	}
 
-	// Slow path: acquire or create the entry and install a fresh loading
-	// if it has no live value. loadOrStoreEntry takes the trie's per-bucket
-	// lock for the insert/replace window.
-	e, _ := c.t.loadOrStoreEntry(k, nil)
-
-	// Either the entry is newly created (p=nil), tombstoned (p=nil from a
-	// prior Delete), or holds a live loading from a concurrent Get/Set. We
-	// loop to handle the race where p is non-nil but expired/errored — we
-	// want to replace it with a fresh loading and carry forward a stale.
+	// Slow path: acquire or create the entry, installing a fresh loading
+	// to drive a miss if there is no live value. A loading is always
+	// created before the entry that holds it is published, so a linked
+	// entry never holds a nil value slot; nil means the entry was
+	// tombstoned by Delete or Clean and is permanently dead (see entDel).
 	var l *loading[V]
+outer:
 	for {
-		prev := e.p.Load()
-		if prev == nil {
+		if e == nil {
 			l = &loading[V]{}
 			l.wg.Add(1)
-			if e.p.CompareAndSwap(nil, l) {
-				break
+			var loaded bool
+			if e, loaded = c.t.loadOrStoreEntry(k, l); !loaded {
+				break // we created the entry, holding our loading
 			}
-			continue
 		}
-		// There is an existing value. Use entGet to decide whether to
-		// wait for it (finalized hit), return a stale (finalized but
-		// expired/errored with a stale), or replace (expired with no
-		// stale). For the replace case, we need a fresh loading whose
-		// stale carries the old value.
-		if v, err, s = entGet(e, c.cfg.maxIdleAge); s == Hit {
-			return v, err, s
-		}
-		if s == Stale {
-			// We already have a valid stale to return; a concurrent
-			// goroutine is (or will be) driving the load, and we can
-			// piggyback. But we must ensure *someone* is driving the
-			// load — if the prev loading is finalized but expired and
-			// has a stale, entGet returned Stale but nothing is yet
-			// refreshing. Install a fresh loading now.
-			//
-			// Concretely: if prev is finalized, we race to replace it.
-			// If prev is still loading (not finalized), another Get
-			// already triggered a miss; entGet returned prev.stale and
-			// that caller will finalize.
-			if prev.finalized() {
-				l = &loading[V]{
-					stale: entMaybeNewStale(e, c.cfg.maxStaleAge),
-				}
-				l.wg.Add(1)
-				if !e.p.CompareAndSwap(prev, l) {
-					continue
-				}
-				break
+		for {
+			prev := e.p.Load()
+			if prev == nil {
+				// Tombstoned. Unlink the dead entry (idempotent: the
+				// predicate re-checks under the bucket lock and leaves
+				// a re-created live entry alone) and start over with a
+				// fresh entry.
+				c.t.deleteEntryIf(k, entDead[K, V])
+				e = nil
+				continue outer
 			}
-			// Loading in flight; return the stale from entGet.
-			return v, err, s
-		}
-		// Miss: prev is finalized, expired, and has no valid stale (or
-		// prev is tombstoned and slipped through the nil check above via
-		// race). Install a fresh loading with a stale snapshot from prev.
-		l = &loading[V]{
-			stale: entMaybeNewStale(e, c.cfg.maxStaleAge),
-		}
-		l.wg.Add(1)
-		if e.p.CompareAndSwap(prev, l) {
-			break
+			// There is an existing value. Use entGet to decide whether
+			// to wait for it (finalized hit), return a stale (load in
+			// flight with a valid stale), or replace it (finalized but
+			// expired or errored).
+			if v, err, s = entGet(e, c.cfg.maxIdleAge); s == Hit {
+				return v, err, s
+			}
+			if s == Stale && !prev.finalized() {
+				// A load is already in flight and its caller will
+				// finalize it; piggyback and return the stale now.
+				return v, err, s
+			}
+			// prev is finalized and expired or errored, possibly with a
+			// valid stale that nothing is refreshing (if it was in
+			// flight with no stale, entGet waited for it to finalize).
+			// Install a fresh loading carrying a stale snapshot of prev
+			// and drive a new load. The CAS fails if another goroutine
+			// got here first; re-evaluate what it installed.
+			l = &loading[V]{
+				stale: entMaybeNewStale(e, c.cfg.maxStaleAge),
+			}
+			l.wg.Add(1)
+			if e.p.CompareAndSwap(prev, l) {
+				break outer
+			}
 		}
 	}
 
@@ -320,18 +317,19 @@ func (c *Cache[K, V]) Delete(k K) (v V, err error, _ KeyState) {
 	if e == nil {
 		return v, err, Miss
 	}
-	v, err, s := entTryGet(e, 0, 0)
-	// Tombstone the value slot first so any lingering in-flight readers
-	// see nothing. Then physically remove the entry from the trie so that
-	// the key (and any memory it refers to) is eligible for GC.
-	entDel(e)
-	c.t.deleteEntryIf(k, func(ee *ent[K, V]) bool {
-		// Only remove if nobody resurrected the slot under the lock. A
-		// concurrent Swap between entDel above and the lock below may
-		// have installed a fresh loading; leave that entry alone.
-		return ee.p.Load() == nil
-	})
-	return v, err, s
+	// Tombstone the value slot first; the captured loading is exactly what
+	// this Delete removed, so the returned value is the value removed.
+	// Then physically unlink the entry from the trie so the key (and any
+	// memory it refers to) is eligible for GC. The nil slot is terminal
+	// (see entDel), so entDead observed under the bucket lock is stable; a
+	// concurrent Swap or Get that finds the tombstone re-creates the key
+	// as a fresh entry, which the predicate leaves alone.
+	was := entDel(e)
+	c.t.deleteEntryIf(k, entDead[K, V])
+	if was == nil {
+		return v, err, Miss
+	}
+	return loadingTryGet(was, 0, 0)
 }
 
 // Expire sets a stored value to expire immediately, meaning the next Get will
@@ -400,14 +398,13 @@ func (c *Cache[K, V]) Clean() {
 		return true
 	})
 
-	// Second pass: remove tombstoned entries, but only if they are still
-	// tombstoned under the trie's bucket lock. A concurrent Swap may have
-	// resurrected the entry with a fresh loading in the meantime; in that
-	// case we leave it alone.
+	// Second pass: physically unlink the tombstoned entries. The nil value
+	// slot is terminal (see entDel), so the predicate observing nil under
+	// the bucket lock cannot be invalidated by a concurrent writer; if the
+	// key was deleted and re-created in the meantime, the lookup finds the
+	// fresh live entry and the predicate leaves it alone.
 	for _, k := range toPrune {
-		c.t.deleteEntryIf(k, func(e *ent[K, V]) bool {
-			return e.p.Load() == nil
-		})
+		c.t.deleteEntryIf(k, entDead[K, V])
 	}
 }
 
@@ -469,34 +466,44 @@ func (c *Cache[K, V]) Swap(k K, v V) (old V, oldErr error, oldState KeyState) {
 		old, oldErr, oldState = was.v, was.err, Hit
 	}()
 
-	// Fast path: if the entry already exists, CAS the value slot directly
-	// without going through the trie's bucket lock.
+	// Fast path: if the entry already exists with a live value, CAS the
+	// value slot directly without going through the trie's bucket lock. A
+	// nil slot means the entry was tombstoned by Delete or Clean; it is
+	// never written again (see entDel), so we fall to the slow path to
+	// re-create the key rather than writing into the dead entry.
 	if e := c.t.loadEntry(k); e != nil {
-		rm := e.p.Load()
-		was = rm
-		if e.p.CompareAndSwap(rm, l) {
-			return old, oldErr, oldState
+		if rm := e.p.Load(); rm != nil {
+			was = rm
+			if e.p.CompareAndSwap(rm, l) {
+				return old, oldErr, oldState
+			}
+			// Lost the CAS; fall into the slow path.
 		}
-		// Lost the CAS; fall into the slow path where we can reason
-		// about the entry under the trie's bucket lock.
 	}
 
-	// Slow path: get or create an entry and swap in our value. The trie's
-	// bucket lock ensures creation is exclusive; Swap on the value slot is
-	// atomic.
-	e, _ := c.t.loadOrStoreEntry(k, l)
-	// If the entry was freshly created with value=l, we're done. Otherwise
-	// atomically swap in l and capture the previous loading.
+	// Slow path: get or create an entry and swap our value in. The trie's
+	// bucket lock makes creation exclusive; tombstoned entries are
+	// unlinked and the key re-created as a fresh entry, never resurrected
+	// in place.
 	for {
-		rm := e.p.Load()
-		if rm == l {
+		e, loaded := c.t.loadOrStoreEntry(k, l)
+		if !loaded {
 			// We are the entry's installer; nothing was there before.
 			was = nil
 			return old, oldErr, oldState
 		}
-		was = rm
-		if e.p.CompareAndSwap(rm, l) {
-			return old, oldErr, oldState
+		for {
+			rm := e.p.Load()
+			if rm == nil {
+				// Tombstoned by Delete or Clean. Unlink the dead entry
+				// and retry with a fresh one.
+				c.t.deleteEntryIf(k, entDead[K, V])
+				break
+			}
+			was = rm
+			if e.p.CompareAndSwap(rm, l) {
+				return old, oldErr, oldState
+			}
 		}
 	}
 }
@@ -539,12 +546,18 @@ func (c *Cache[K, V]) CompareAndDelete(k K, old V) bool {
 	if e == nil {
 		return false
 	}
-	return c.tryCAS(e, old, old, false)
+	if !c.tryCAS(e, old, old, false) {
+		return false
+	}
+	// The successful CAS tombstoned the value slot; physically unlink the
+	// entry like Delete does, so delete churn does not leak entries.
+	c.t.deleteEntryIf(k, entDead[K, V])
+	return true
 }
 
 func (c *Cache[K, V]) tryCAS(e *ent[K, V], old, new V, useNew bool) bool {
 	l := e.p.Load()
-	if l == nil || !l.onlyFinalized() || any(l.v) != any(old) {
+	if l == nil || !l.finalized() || any(l.v) != any(old) {
 		return false
 	}
 	var l2 *loading[V]
@@ -556,7 +569,7 @@ func (c *Cache[K, V]) tryCAS(e *ent[K, V], old, new V, useNew bool) bool {
 			return true
 		}
 		l = e.p.Load()
-		if l == nil || !l.onlyFinalized() || any(l.v) != any(old) {
+		if l == nil || !l.finalized() || any(l.v) != any(old) {
 			return false
 		}
 	}
@@ -584,24 +597,34 @@ func (c *Cache[K, V]) finalizedLoading(v V) *loading[V] {
 	return l
 }
 
-func (l *loading[V]) finalized() bool     { return l.state.Load() != 0 }
-func (l *loading[V]) onlyFinalized() bool { return l.state.Load() == 1 }
+func (l *loading[V]) finalized() bool { return l.state.Load() != 0 }
 
-// entDel tombstones the entry by atomically setting its value slot to nil.
-// The entry itself remains in the trie; Clean later removes tombstones
-// physically. This matches the old "e.del then promote" pattern so that a
-// concurrent Swap can resurrect the entry by re-populating the value slot.
-func entDel[K comparable, V any](e *ent[K, V]) {
+// entDel tombstones the entry by atomically setting its value slot to nil,
+// returning the loading it displaced (nil if the entry was already
+// tombstoned).
+//
+// A nil value slot is terminal: no code path ever stores a non-nil loading
+// over it. Writers that encounter a tombstone unlink the dead entry
+// (deleteEntryIf with entDead) and re-create the key as a fresh entry. This
+// is what makes physical unlinking sound: entDead evaluated under the
+// trie's bucket lock cannot be invalidated by a concurrent lock-free CAS,
+// so an unlinked entry is always dead and a live entry is never unlinked.
+func entDel[K comparable, V any](e *ent[K, V]) *loading[V] {
 	for {
 		p := e.p.Load()
 		if p == nil {
-			return
+			return nil
 		}
 		if e.p.CompareAndSwap(p, nil) {
-			return
+			return p
 		}
 	}
 }
+
+// entDead reports whether the entry is tombstoned. Used as a deleteEntryIf
+// predicate: nil value slots are terminal (see entDel), so a nil observed
+// under the bucket lock is stable.
+func entDead[K comparable, V any](e *ent[K, V]) bool { return e.p.Load() == nil }
 
 // entLoad returns the entry's current loading, or nil if the slot is
 // tombstoned. Callers guarantee e is non-nil.
@@ -705,8 +728,15 @@ func entTryGet[K comparable, V any](e *ent[K, V], n64 int64, extend time.Duratio
 	if l == nil {
 		return v, err, state
 	}
+	return loadingTryGet(l, n64, extend)
+}
+
+// loadingTryGet is entTryGet for a loading already plucked from an entry;
+// Delete uses it directly on the loading it captured while tombstoning, so
+// the value it returns is exactly the value it removed.
+func loadingTryGet[V any](l *loading[V], n64 int64, extend time.Duration) (v V, err error, state KeyState) {
 	// Fast path: finalized, no expiry, no error — skip time checks.
-	if l.onlyFinalized() && l.expires.Load() == 0 && l.err == nil {
+	if l.finalized() && l.expires.Load() == 0 && l.err == nil {
 		return l.v, nil, Hit
 	}
 	if n64 == 0 {
@@ -753,15 +783,9 @@ type Item[V any] struct {
 // semantics. If you do not need to configure an item at all, the zero value
 // item is valid and usable.
 func NewItem[V any](opts ...Opt) *Item[V] {
-	var c cfg
-	for _, opt := range opts {
-		opt.apply(&c)
-	}
-	return &Item[V]{
-		c: Cache[struct{}, V]{
-			cfg: c,
-		},
-	}
+	i := new(Item[V])
+	initCache(&i.c, opts...)
+	return i
 }
 
 // Get returns the currently cached value, running the miss function in a
@@ -829,6 +853,20 @@ func (i *Item[V]) Clear() {
 	i.c.Clear()
 }
 
+// Clean deletes the item if it is expired. The item is expired if MaxAge is
+// used and the item is older than the max age, or if you manually expired
+// it. If MaxStaleAge is used and not -1, the item must be older than MaxAge
+// + MaxStaleAge. If MaxStaleAge is -1, Clean returns immediately.
+func (i *Item[V]) Clean() {
+	i.c.Clean()
+}
+
+// StopAutoClean stops the auto clean goroutine that is began with the
+// AutoClean option.
+func (i *Item[V]) StopAutoClean() {
+	i.c.StopAutoClean()
+}
+
 /////////
 // SET //
 /////////
@@ -844,15 +882,9 @@ type Set[K comparable] struct {
 // semantics. If you do not need to configure an set at all, the zero value set
 // is valid and usable.
 func NewSet[K comparable](opts ...Opt) *Set[K] {
-	var c cfg
-	for _, opt := range opts {
-		opt.apply(&c)
-	}
-	return &Set[K]{
-		c: Cache[K, struct{}]{
-			cfg: c,
-		},
-	}
+	s := new(Set[K])
+	initCache(&s.c, opts...)
+	return s
 }
 
 // Get ensures the key is cached, running the miss function in a goroutine if

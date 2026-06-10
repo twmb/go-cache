@@ -61,8 +61,6 @@ func TestSwap_CancelsInFlightGet(t *testing.T) {
 // TestSwap_OverExpiredFinalizedWithStale exercises the defer branch that
 // reads the prior entry's stale when the prior entry has expired but a valid
 // stale is still in its window.
-//
-// Covers cache.go Swap defer lines for expired-with-stale (lines 451-457).
 func TestSwap_OverExpiredFinalizedWithStale(t *testing.T) {
 	c := New[string, int](
 		MaxAge(5*time.Millisecond),
@@ -179,7 +177,7 @@ func TestExpire_NoOpDuringInFlightLoad(t *testing.T) {
 // queries for the same key.
 //
 // The guarantee is weaker than it looks: with del0, the loading finalizes
-// expired, so the *next* goroutine that acquires c.mu after the leader's
+// expired, so the next goroutine that re-checks the entry after the leader's
 // setve sees an expired entry and triggers a fresh miss. Concurrent arrivals
 // still collapse in batches, but "batch" here means "whatever queued on a
 // given loading's WaitGroup before it was Done'd," which is scheduler-
@@ -418,19 +416,13 @@ func TestCleanUnderConcurrency(t *testing.T) {
 	wg.Wait()
 }
 
-// TestSwap_OverPromotingDelete forces two rare branches simultaneously:
-//
-//  1. Swap's unlocked fast path observes an entry whose pointer is the
-//     promotingDelete sentinel (cache.go:474-475) and falls through to the
-//     locked path.
-//  2. promote's inner CAS(nil, pd) fails because a concurrent Swap wrote a
-//     fresh loading into e.p between promote's Load and CAS (cache.go:636).
-//
-// Both windows are ~nanoseconds wide; we stress with many deleters + many
-// swappers + an aggressive Range driver for long enough that both branches
-// land. On a fast machine, either can land within a few hundred ms, but we
-// leave a generous budget for slow CI runners.
-func TestSwap_OverPromotingDelete(t *testing.T) {
+// TestSwap_DeleteRangeChurn stresses Swap's unlocked fast path racing
+// Delete's tombstone-then-unlink, with Range walking the trie throughout:
+// Swap must observe tombstones and re-create keys (never resurrect a dying
+// entry), and Range must tolerate entries being unlinked mid-walk. The
+// interesting windows are ~nanoseconds wide; we stress from many angles for
+// long enough that they land, leaving a generous budget for slow CI runners.
+func TestSwap_DeleteRangeChurn(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in -short")
 	}
@@ -445,8 +437,8 @@ func TestSwap_OverPromotingDelete(t *testing.T) {
 	var wg sync.WaitGroup
 	var stop atomic.Bool
 
-	// Deleters churn the primed keys, repeatedly creating the nil-e.p window
-	// that promote's CAS(nil, pd) targets.
+	// Deleters churn the primed keys, repeatedly creating the tombstone +
+	// unlink windows that Swap's fast path must handle.
 	for range 8 {
 		wg.Add(1)
 		go func() {
@@ -459,7 +451,7 @@ func TestSwap_OverPromotingDelete(t *testing.T) {
 		}()
 	}
 	// Swappers on the same primed keys exercise the unlocked fast-path CAS
-	// that races with promote.
+	// that races with the deleters.
 	for w := range 8 {
 		wg.Add(1)
 		go func(w int) {
@@ -471,10 +463,9 @@ func TestSwap_OverPromotingDelete(t *testing.T) {
 			}
 		}(w)
 	}
-	// Churners add+delete NEW keys continuously so that dirty stays populated,
-	// which keeps r.incomplete=true and forces Range to call promote on every
-	// iteration. Without this, the initial promote fires once and subsequent
-	// Ranges skip the work.
+	// Churners add+delete NEW keys continuously so the trie's shape keeps
+	// changing (inserts expand slots, deletes prune empty parents) while
+	// Range walks it.
 	for w := range 4 {
 		wg.Add(1)
 		go func(w int) {
@@ -488,7 +479,7 @@ func TestSwap_OverPromotingDelete(t *testing.T) {
 			}
 		}(w)
 	}
-	// Range callers hammer promote.
+	// Range callers walk the trie throughout the churn.
 	for range 4 {
 		wg.Add(1)
 		go func() {
@@ -621,16 +612,11 @@ func TestSetve_RacesWithSwap(t *testing.T) {
 	}
 }
 
-// TestPromote_ConcurrentDeleteOfNilEntry forces promote to observe an entry
-// whose pointer is nil but becomes non-nil between the Load and the
-// CompareAndSwap(nil, pd) inside promote's retry loop. Covers the reload
-// statement inside promote.
-//
-// This exercises cache.go:promote retry loop. Deterministic coverage of the
-// exact reload line requires a goroutine interleaving that we cannot force
-// from the outside; we stress via concurrent Delete/Set/Range to try to hit
-// it.
-func TestPromote_ConcurrentDeleteOfNilEntry(t *testing.T) {
+// TestRange_DeleteSetChurn races Range against a goroutine that
+// continuously Deletes and re-Sets the same keys: every key cycles through
+// tombstone, physical unlink, and fresh re-creation while the walk is in
+// flight. Correctness is no panic and no race-detector report.
+func TestRange_DeleteSetChurn(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in -short")
 	}
@@ -677,16 +663,12 @@ func TestClean_NoopWhenStalesArePermanent(t *testing.T) {
 	}
 }
 
-// TestGet_UnlockedMissThenLockedHit targets Get's locked-path Hit (cache.go
-// lines 233-236): unlocked e.get returned Miss, but by the time we acquire
-// c.mu and re-check, a concurrent Swap has published a fresh value for the
-// same key in the read map.
-//
-// Requires the entry to live in the read map (not dirty). We force that by
-// priming + Range (promote), then Expire to make the unlocked fast-path Miss,
-// then race a Swap against a Get. Hitting the exact timing window requires
-// multiple iterations.
-func TestGet_UnlockedMissThenLockedHit(t *testing.T) {
+// TestGet_RacesSwapOnExpired targets Get's slow-path Hit: the fast path
+// sees an expired entry (Miss), but by the time the slow path re-checks, a
+// concurrent Swap has published a fresh value for the same key. If Get
+// reports a Hit it must be the Swap's value, never the expired one. Hitting
+// the exact timing window requires multiple iterations.
+func TestGet_RacesSwapOnExpired(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping race-iteration test in -short")
 	}
@@ -713,10 +695,11 @@ func TestGet_UnlockedMissThenLockedHit(t *testing.T) {
 	}
 }
 
-// TestCompareAndSwap_LockPromotedEntry targets the CompareAndSwap locked
-// branch where the entry was only observable via dirty on fast path but has
-// since been promoted into the read map (cache.go lines 532-534). Race window.
-func TestCompareAndSwap_LockPromotedEntry(t *testing.T) {
+// TestCompareAndSwap_RacesSet races CompareAndSwap against the first Set of
+// the same key (plus a Range walk): the CAS may observe no entry, an
+// in-flight entry, or the finalized value, and must succeed only in the
+// last case. Race window; stress only.
+func TestCompareAndSwap_RacesSet(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping race-iteration test in -short")
 	}
@@ -737,17 +720,11 @@ func TestCompareAndSwap_LockPromotedEntry(t *testing.T) {
 	}
 }
 
-// TestPromote_CASRetryOnConcurrentWrite targets promote's reload-after-failed-
-// CAS line (cache.go line 636). The condition: promote holds c.mu, sees
-// e.p=nil, tries CAS(nil, c.pd). The CAS fails because a concurrent goroutine
-// (Get under c.mu could not run; Swap via unlocked fast path could not, since
-// it requires e in read map — wait, it IS in read map here — so this window
-// opens when Swap's unlocked CAS loop is active for an entry that was deleted
-// during promote's iteration).
-//
-// We exercise by having many concurrent Swap/Delete/Range cycles so promote
-// encounters entries mid-flux. Race-dependent; stress only.
-func TestPromote_CASRetryOnConcurrentWrite(t *testing.T) {
+// TestSwap_DeleteSwapRangeCycles cycles Delete-then-Swap on a fixed key set
+// while Range walks: each cycle drives an entry through tombstone, unlink,
+// and re-creation, so Swap's slow path repeatedly encounters entries
+// mid-deletion. Race-dependent; stress only.
+func TestSwap_DeleteSwapRangeCycles(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in -short")
 	}
@@ -784,10 +761,9 @@ func TestPromote_CASRetryOnConcurrentWrite(t *testing.T) {
 }
 
 // TestMemoryBounded churns a fixed key set in and out of the cache. We don't
-// assert exact bytes; we assert that after N rounds of (Set, Get, Delete,
-// Range-triggered promote), the resident entry count is bounded by the number
-// of live keys. This would catch a regression where dirty-map bookkeeping
-// leaked entries.
+// assert exact bytes; we assert that after N rounds of (Set, Delete, Range),
+// the resident entry count is bounded by the number of live keys. This would
+// catch a regression where Delete stopped physically unlinking entries.
 func TestMemoryBounded(t *testing.T) {
 	c := New[int, int]()
 	const liveKeys = 32
@@ -804,7 +780,6 @@ func TestMemoryBounded(t *testing.T) {
 		for i := range liveKeys {
 			c.Set(i, i)
 		}
-		// Trigger promote.
 		c.Range(func(int, int, error) bool { return true })
 	}
 
@@ -813,4 +788,88 @@ func TestMemoryBounded(t *testing.T) {
 	if count > liveKeys {
 		t.Fatalf("after %d rounds: %d live entries, want <= %d", rounds, count, liveKeys)
 	}
+}
+
+// TestSwap_NotLostDuringConcurrentDelete verifies that a Swap racing a
+// Delete of the same key is never silently dropped. The dangerous
+// interleaving: Delete tombstones the value slot, Swap observes the
+// tombstone, and Delete's physical unlink races Swap's installation of the
+// new value. A nil value slot is terminal — Swap must re-create the key as
+// a fresh entry, never write into the dying one — so if Swap returns Miss
+// ("I stored into nothing"), it linearized after the Delete and the swapped
+// value must be visible afterwards.
+//
+// Regression test: an earlier version resurrected tombstones with a bare
+// CAS not serialized with deleteEntryIf's unlink, losing the swapped value
+// in ~0.03% of rounds.
+func TestSwap_NotLostDuringConcurrentDelete(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stress test in -short")
+	}
+	const rounds = 100_000
+	for i := range rounds {
+		c := New[int, int]()
+		c.Set(i, 0)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		var swapState KeyState
+		go func() {
+			defer wg.Done()
+			c.Delete(i)
+		}()
+		go func() {
+			defer wg.Done()
+			_, _, swapState = c.Swap(i, 1)
+		}()
+		wg.Wait()
+
+		if swapState == Miss {
+			if v, _, s := c.TryGet(i); s.IsMiss() || v != 1 {
+				t.Fatalf("round %d: Swap returned Miss (stored after the Delete) but TryGet=(%d,%v); the swapped value was silently dropped", i, v, s)
+			}
+		}
+	}
+}
+
+// TestClean_DoesNotEvictFreshEntries runs Clean continuously against Gets
+// on a cache with no MaxAge and no Deletes: nothing ever expires, so Clean
+// must never remove anything and every completed Get must be a subsequent
+// TryGet hit.
+//
+// Regression test: an earlier version created Get's entry with a nil value
+// slot and CAS'd the loading in afterwards; in that window the fresh entry
+// was indistinguishable from a Delete tombstone and Clean would unlink it,
+// losing the cached value (and with it, request collapsing for that key).
+func TestClean_DoesNotEvictFreshEntries(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stress test in -short")
+	}
+	c := New[int, int]()
+
+	stop := make(chan struct{})
+	var cleanWg sync.WaitGroup
+	cleanWg.Add(1)
+	go func() {
+		defer cleanWg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				c.Clean()
+				runtime.Gosched()
+			}
+		}
+	}()
+
+	const rounds = 200_000
+	for i := range rounds {
+		c.Get(i, func() (int, error) { return i, nil })
+		if v, _, s := c.TryGet(i); s.IsMiss() || v != i {
+			t.Fatalf("round %d: freshly loaded entry evicted by Clean: TryGet=(%d,%v)", i, v, s)
+		}
+	}
+	close(stop)
+	cleanWg.Wait()
 }

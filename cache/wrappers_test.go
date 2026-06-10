@@ -273,11 +273,27 @@ func TestSet_Clear(t *testing.T) {
 	}
 }
 
-func TestSet_StopAutoClean(t *testing.T) {
+func TestSet_AutoClean(t *testing.T) {
+	// NewSet must actually start the autoclean goroutine (a regression had
+	// NewSet building the Cache directly, silently ignoring the option);
+	// the cleaning behavior itself is covered by the Cache autoclean tests.
 	s := NewSet[string](MaxAge(time.Millisecond), AutoCleanInterval(time.Millisecond))
+	if s.c.quitClean == nil {
+		t.Fatal("NewSet with AutoCleanInterval should start the autoclean goroutine")
+	}
 	s.StopAutoClean()
 	// Calling twice is safe (sync.Once on the underlying Cache).
 	s.StopAutoClean()
+}
+
+func TestItem_AutoClean(t *testing.T) {
+	i := NewItem[int](MaxAge(time.Millisecond), AutoCleanInterval(time.Millisecond))
+	if i.c.quitClean == nil {
+		t.Fatal("NewItem with AutoCleanInterval should start the autoclean goroutine")
+	}
+	defer i.StopAutoClean()
+	i.Set(1)
+	i.Clean() // manual Clean is also exposed on Item
 }
 
 func TestSet_ZeroValue(t *testing.T) {

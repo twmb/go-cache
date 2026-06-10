@@ -8,8 +8,7 @@ import (
 )
 
 // trie is a concurrent hash-trie map, modeled on Go's internal/sync
-// HashTrieMap. It is intended to replace Cache's read/dirty backing store.
-// For now it is standalone and only exercised by trie_test.go.
+// HashTrieMap. It is the backing store for Cache.
 //
 // Design notes:
 //
@@ -289,11 +288,13 @@ func (t *trie[K, V]) deleteEntry(k K) *trieEntry[K, V] {
 }
 
 // deleteEntryIf is like deleteEntry, but only proceeds if pred(entry)
-// returns true when evaluated under the parent's lock. This lets callers
-// guard against racing resurrections: for example, Clean wants to
-// physically remove an entry whose value slot is nil, but only if the slot
-// is still nil at the moment the lock is acquired (a concurrent Swap may
-// have CAS'd a fresh loading in since Clean's initial walk observed nil).
+// returns true when evaluated under the parent's lock. Cache uses this to
+// physically unlink only tombstoned entries (nil value slot). The value
+// slot of a tombstoned entry never transitions back to non-nil (see entDel
+// in cache.go), so a nil observed by pred under the lock cannot be
+// invalidated by a concurrent writer; and if the key was deleted and
+// re-created in the meantime, the lookup finds the fresh live entry and
+// pred leaves it alone.
 //
 // If pred is nil, deleteEntryIf is equivalent to unconditional deletion.
 func (t *trie[K, V]) deleteEntryIf(k K, pred func(*trieEntry[K, V]) bool) *trieEntry[K, V] {
@@ -335,9 +336,19 @@ func (t *trie[K, V]) deleteEntryIf(k K, pred func(*trieEntry[K, V]) bool) *trieE
 			continue
 		}
 		n = slot.Load()
-		if n == nil || !n.isEntry {
+		if n == nil {
+			// The entry was deleted concurrently; nothing to do.
 			i.mu.Unlock()
 			return nil
+		}
+		if !n.isEntry {
+			// The slot expanded into an indirect node between our
+			// unlocked walk and the lock (a concurrent insert with a
+			// colliding hash prefix built out this level). The key may
+			// now live deeper in the new subtree; retry from the root,
+			// as internal/sync.HashTrieMap's find does.
+			i.mu.Unlock()
+			continue
 		}
 		break
 	}

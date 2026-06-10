@@ -81,8 +81,9 @@ func TestTrie_LoadOrStoreExisting(t *testing.T) {
 }
 
 func TestTrie_LoadOrStoreWithNilValue(t *testing.T) {
-	// Cache's Get path constructs an entry with no value yet, then fills it.
-	// Verify loadOrStoreEntry(k, nil) is legal and the entry.p is nil.
+	// Cache always creates entries with a value in place (a nil slot means
+	// tombstoned), but the trie itself is value-agnostic: verify
+	// loadOrStoreEntry(k, nil) is legal and the entry.p is nil.
 	var tr trie[string, int]
 	e, loaded := tr.loadOrStoreEntry("k", nil)
 	if loaded {
@@ -463,8 +464,8 @@ func TestTrie_RangeDuringMutation(t *testing.T) {
 }
 
 // TestTrie_DeleteMissingInCollisionChain walks an overflow chain in search
-// of a key that is never present, exercising the "walk to end without
-// finding" branch of trieRemoveFromChain.
+// of a key that is never present, exercising deleteEntryIf's
+// "walk the chain to the end without finding k" branch.
 func TestTrie_DeleteMissingInCollisionChain(t *testing.T) {
 	var tr trie[string, int]
 	tr.hashFn = func(string) uintptr { return 0x1234 }
@@ -529,7 +530,10 @@ func TestTrie_DeleteRaceRetries(t *testing.T) {
 // TestTrie_DeleteRaceAgainstExpand targets deleteEntryIf's "slot changed to
 // non-entry after lock" branch. An indirect-node split (expand) during the
 // window between delete's unlocked walk and its parent.Lock forces the
-// reload to see a non-entry node.
+// reload to see a non-entry node, which must trigger a retry from the root
+// (matching internal/sync.HashTrieMap's find), not a give-up: "a" is present
+// for the whole round until the delete removes it, so deleteEntry("a") must
+// always find and return it.
 //
 // We use a controlled hashFn that collides a few keys in the top bits but
 // not all bits, so inserting them triggers expand. Concurrent insert+delete
@@ -547,7 +551,7 @@ func TestTrie_DeleteRaceAgainstExpand(t *testing.T) {
 		"c": 0xA000000000000002,
 		"d": 0xB000000000000000,
 	}
-	for range 500 {
+	for i := range 20_000 {
 		var tr trie[string, int]
 		tr.hashFn = func(k string) uintptr { return hashes[k] }
 		triePut(&tr, "a", 1)
@@ -555,6 +559,7 @@ func TestTrie_DeleteRaceAgainstExpand(t *testing.T) {
 
 		var wg sync.WaitGroup
 		wg.Add(3)
+		var deleted *trieEntry[string, int]
 		go func() {
 			defer wg.Done()
 			triePut(&tr, "b", 2)
@@ -565,9 +570,21 @@ func TestTrie_DeleteRaceAgainstExpand(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			tr.deleteEntry("a")
+			deleted = tr.deleteEntry("a")
 		}()
 		wg.Wait()
+
+		if deleted == nil || deleted.key != "a" {
+			t.Fatalf("round %d: deleteEntry(a) = %v, want the entry for a (delete must retry across a concurrent expand)", i, deleted)
+		}
+		if e := tr.loadEntry("a"); e != nil {
+			t.Fatalf("round %d: a still present after deleteEntry returned it", i)
+		}
+		for _, k := range []string{"b", "c", "d"} {
+			if _, ok := trieGet(&tr, k); !ok {
+				t.Fatalf("round %d: %s missing after delete of a", i, k)
+			}
+		}
 	}
 }
 
