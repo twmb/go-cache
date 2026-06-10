@@ -444,3 +444,47 @@ func TestMaxIdleAge(t *testing.T) {
 		vcheck(t, got[string]{v, err, s}, got[string]{"", nil, Miss})
 	})
 }
+
+// TestCompareAndSwapAgreesWithTryGet verifies that CompareAndSwap and
+// CompareAndDelete only match live values: expired entries and errored
+// entries are "not there" per TryGet, so comparing against them must fail.
+func TestCompareAndSwapAgreesWithTryGet(t *testing.T) {
+	t.Run("expired", func(t *testing.T) {
+		c := New[string, int](MaxAge(time.Hour))
+		c.Set("k", 1)
+		c.Expire("k")
+		if _, _, s := c.TryGet("k"); !s.IsMiss() {
+			t.Fatal("expired entry should TryGet Miss")
+		}
+		if c.CompareAndSwap("k", 1, 2) {
+			t.Error("CompareAndSwap matched an expired value")
+		}
+		if c.CompareAndDelete("k", 1) {
+			t.Error("CompareAndDelete matched an expired value")
+		}
+	})
+
+	t.Run("errored", func(t *testing.T) {
+		c := New[string, int]()
+		c.Get("k", func() (int, error) { return 0, errors.New("boom") })
+		// The errored loading's v is the zero int; CAS against 0 must not
+		// treat that as a cached value.
+		if c.CompareAndSwap("k", 0, 2) {
+			t.Error("CompareAndSwap matched an errored entry's placeholder value")
+		}
+		if c.CompareAndDelete("k", 0) {
+			t.Error("CompareAndDelete matched an errored entry's placeholder value")
+		}
+	})
+
+	t.Run("live", func(t *testing.T) {
+		c := New[string, int](MaxAge(time.Hour))
+		c.Set("k", 1)
+		if !c.CompareAndSwap("k", 1, 2) {
+			t.Error("CompareAndSwap failed on a live matching value")
+		}
+		if !c.CompareAndDelete("k", 2) {
+			t.Error("CompareAndDelete failed on a live matching value")
+		}
+	})
+}

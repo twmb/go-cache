@@ -213,6 +213,12 @@ func initCache[K comparable, V any](c *Cache[K, V], opts ...Opt) {
 // if the key is not yet cached. If stale values are enabled, the currently
 // cached value has an error, and there is an unexpired stale value, this
 // returns the stale value and no error.
+//
+// The miss function runs on an internal goroutine: if it panics, the process
+// crashes (the panic cannot be recovered by the Get caller); recover inside
+// miss if you need to survive panics. A miss function must not call Get for
+// the same key, in this goroutine or another: the inner Get would wait on
+// the load the outer Get is driving and deadlock.
 func (c *Cache[K, V]) Get(k K, miss func() (V, error)) (v V, err error, s KeyState) {
 	// Fast path: if the entry already exists and holds a live value, use
 	// it without any locking.
@@ -530,7 +536,9 @@ func (c *Cache[K, V]) Set(k K, v V) {
 }
 
 // CompareAndSwap swaps the old and new values for k if the value has finished
-// loading and the value is equal to old. The type V must be comparable.
+// loading without an error, is not expired, and is equal to old. The type V
+// must be comparable. Stale values are not considered: only the live value
+// is compared against.
 func (c *Cache[K, V]) CompareAndSwap(k K, old, new V) bool {
 	e := c.t.loadEntry(k)
 	if e == nil {
@@ -540,7 +548,9 @@ func (c *Cache[K, V]) CompareAndSwap(k K, old, new V) bool {
 }
 
 // CompareAndDelete deletes the entry for k if the value has finished loading
-// and the value is equal to old. The type V must be comparable.
+// without an error, is not expired, and is equal to old. The type V must be
+// comparable. Stale values are not considered: only the live value is
+// compared against.
 func (c *Cache[K, V]) CompareAndDelete(k K, old V) bool {
 	e := c.t.loadEntry(k)
 	if e == nil {
@@ -557,7 +567,7 @@ func (c *Cache[K, V]) CompareAndDelete(k K, old V) bool {
 
 func (c *Cache[K, V]) tryCAS(e *ent[K, V], old, new V, useNew bool) bool {
 	l := e.p.Load()
-	if l == nil || !l.finalized() || any(l.v) != any(old) {
+	if !casMatches(l, old) {
 		return false
 	}
 	var l2 *loading[V]
@@ -569,10 +579,21 @@ func (c *Cache[K, V]) tryCAS(e *ent[K, V], old, new V, useNew bool) bool {
 			return true
 		}
 		l = e.p.Load()
-		if l == nil || !l.finalized() || any(l.v) != any(old) {
+		if !casMatches(l, old) {
 			return false
 		}
 	}
+}
+
+// casMatches reports whether l holds a live cached value equal to old:
+// finalized, not errored, not expired. CompareAndSwap and CompareAndDelete
+// must agree with TryGet about whether a value exists — an expired or
+// errored entry is not a value that can be compared against (an errored
+// loading's v is whatever the miss function returned beside the error,
+// which was never cached as a value).
+func casMatches[V any](l *loading[V], old V) bool {
+	return l != nil && l.finalized() && l.err == nil &&
+		any(l.v) == any(old) && !l.expired(now())
 }
 
 ///////////////////
@@ -705,20 +726,30 @@ func entGet[K comparable, V any](e *ent[K, V], extend time.Duration) (v V, err e
 	// If we waited, we could immediately be expired due to time sync, or
 	// if the user is configured to never cache and they're just using
 	// request collapsing: we still want to return the now expired value.
+	//
+	// The expiry must be loaded before the clock is sampled: Expire stores
+	// now()-1 from its own clock, which can be ahead of a clock sampled
+	// before our load; sampling after the load guarantees a concurrent
+	// Expire is classified as expired here rather than extended over.
+	expires := l.expires.Load()
 	n := now()
-	if (!waited && l.expired(n)) || l.err != nil {
+	expired := expires != 0 && expires <= n
+	if (!waited && expired) || l.err != nil {
 		if l.stale != nil && !l.stale.expired(n) {
 			return l.stale.v, nil, Stale
 		}
 		// The stale value is expired: if our entry is not expired,
 		// this must be an error we waited on.
-		if !l.expired(n) {
+		if !expired {
 			return l.v, l.err, Hit
 		}
 		return v, err, state
 	}
 	if extend > 0 && l.err == nil {
-		l.expires.Store(n + int64(extend))
+		// Extend the idle expiry via CAS against the expiry we evaluated
+		// above so that a concurrent Expire (or Swap finalization) is not
+		// silently overwritten; if expires changed, the other writer wins.
+		l.expires.CompareAndSwap(expires, n+int64(extend))
 	}
 	return l.v, l.err, Hit
 }
@@ -739,22 +770,30 @@ func loadingTryGet[V any](l *loading[V], n64 int64, extend time.Duration) (v V, 
 	if l.finalized() && l.expires.Load() == 0 && l.err == nil {
 		return l.v, nil, Hit
 	}
-	if n64 == 0 {
-		n64 = now()
-	}
-	n := n64
-
 	// If we are loading but there is a valid stale, return it, otherwise
 	// return immediately: no get.
 	if !l.finalized() {
-		if l.stale != nil && !l.stale.expired(n) {
+		if n64 == 0 {
+			n64 = now()
+		}
+		if l.stale != nil && !l.stale.expired(n64) {
 			return l.stale.v, nil, Stale
 		}
 		return v, err, state
 	}
 
 	// If we have an error or we are expired, we maybe return the stale.
-	if expired := l.expired(n); l.err != nil || expired {
+	// The expiry must be loaded before the clock is sampled (when we are
+	// the one sampling it); see the matching comment in entGet. A caller-
+	// provided n64 (Range's batch timestamp) never extends, so the
+	// ordering does not matter there.
+	expires := l.expires.Load()
+	if n64 == 0 {
+		n64 = now()
+	}
+	n := n64
+	expired := expires != 0 && expires <= n
+	if l.err != nil || expired {
 		if l.stale != nil && !l.stale.expired(n) {
 			return l.stale.v, nil, Stale
 		}
@@ -763,7 +802,9 @@ func loadingTryGet[V any](l *loading[V], n64 int64, extend time.Duration) (v V, 
 		}
 	}
 	if extend > 0 && l.err == nil {
-		l.expires.Store(n + int64(extend))
+		// CAS so a concurrent Expire is not silently overwritten; see the
+		// matching comment in entGet.
+		l.expires.CompareAndSwap(expires, n+int64(extend))
 	}
 	return l.v, l.err, Hit
 }
@@ -791,7 +832,8 @@ func NewItem[V any](opts ...Opt) *Item[V] {
 // Get returns the currently cached value, running the miss function in a
 // goroutine if the item is not yet cached. If stale values are enabled, the
 // currently cached value has an error, and there is an unexpired stale value,
-// this returns the stale value and no error.
+// this returns the stale value and no error. See Cache.Get for the miss
+// function's panic and re-entrancy caveats.
 func (i *Item[V]) Get(miss func() (V, error)) (v V, err error, state KeyState) {
 	return i.c.Get(struct{}{}, miss)
 }
@@ -837,13 +879,15 @@ func (i *Item[V]) Swap(v V) (old V, oldErr error, oldState KeyState) {
 }
 
 // CompareAndSwap swaps the old and new values if the value has finished
-// loading and the value is equal to old. The type V must be comparable.
+// loading without an error, is not expired, and is equal to old. The type V
+// must be comparable.
 func (i *Item[V]) CompareAndSwap(old, new V) (swapped bool) {
 	return i.c.CompareAndSwap(struct{}{}, old, new)
 }
 
-// CompareAndDelete deletes the item if the value has finished loading and the
-// value is equal to old. The type V must be comparable.
+// CompareAndDelete deletes the item if the value has finished loading
+// without an error, is not expired, and is equal to old. The type V must be
+// comparable.
 func (i *Item[V]) CompareAndDelete(old V) (deleted bool) {
 	return i.c.CompareAndDelete(struct{}{}, old)
 }
@@ -890,7 +934,8 @@ func NewSet[K comparable](opts ...Opt) *Set[K] {
 // Get ensures the key is cached, running the miss function in a goroutine if
 // the key is not yet cached. If stale keys are enabled, the currently cached
 // key has an error, and there is a stale key, this returns with no error and a
-// Stale key state.
+// Stale key state. See Cache.Get for the miss function's panic and
+// re-entrancy caveats.
 func (s *Set[K]) Get(k K, miss func() error) (err error, state KeyState) {
 	_, err, state = s.c.Get(k, func() (struct{}, error) {
 		return struct{}{}, miss()

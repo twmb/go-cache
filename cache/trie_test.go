@@ -29,6 +29,62 @@ func trieGet[K comparable, V any](t *trie[K, V], k K) (V, bool) {
 	return *p, true
 }
 
+// verifyTrie checks structural invariants once concurrent operations have
+// quiesced: every entry hangs at the position prescribed by its hash,
+// overflow chains hold only full-hash collisions, parent pointers are
+// consistent, no linked node is marked dead, and no non-root indirect is
+// empty (pruning must have removed it). It must not run concurrently with
+// mutations.
+func verifyTrie[K comparable, V any](t *testing.T, tr *trie[K, V]) {
+	t.Helper()
+	if !tr.inited.Load() {
+		return
+	}
+	root := tr.root.Load()
+	var walk func(i *trieIndirect[K, V], prefix uintptr, nbits uint)
+	walk = func(i *trieIndirect[K, V], prefix uintptr, nbits uint) {
+		if i.dead.Load() {
+			t.Fatalf("linked indirect at depth %d is marked dead", nbits/trieBranchingLog2)
+		}
+		if i != root && i.empty() {
+			t.Fatalf("empty non-root indirect linked at depth %d (pruning missed it)", nbits/trieBranchingLog2)
+		}
+		for j := range i.children {
+			n := i.children[j].Load()
+			if n == nil {
+				continue
+			}
+			cp := prefix<<trieBranchingLog2 | uintptr(j)
+			cb := nbits + trieBranchingLog2
+			if cb > ptrBits {
+				t.Fatal("trie deeper than the hash bit budget")
+			}
+			if n.isEntry {
+				head := n.entry()
+				headHash := tr.hash(head.key)
+				for e := head; e != nil; e = e.overflow.Load() {
+					h := tr.hash(e.key)
+					if h>>(ptrBits-cb) != cp {
+						t.Fatalf("entry for key %v misplaced: hash %#x does not match its path %#x at depth %d",
+							e.key, h, cp, cb/trieBranchingLog2)
+					}
+					if h != headHash {
+						t.Fatalf("overflow chain mixes hashes: key %v hash %#x vs head %v hash %#x",
+							e.key, h, head.key, headHash)
+					}
+				}
+			} else {
+				ci := n.indirect()
+				if ci.parent != i {
+					t.Fatalf("indirect at depth %d has a wrong parent pointer", cb/trieBranchingLog2)
+				}
+				walk(ci, cp, cb)
+			}
+		}
+	}
+	walk(root, 0, 0)
+}
+
 func TestTrie_ZeroValueLoad(t *testing.T) {
 	var tr trie[string, int]
 	if e := tr.loadEntry("missing"); e != nil {
@@ -237,6 +293,7 @@ func TestTrie_ManyKeys(t *testing.T) {
 			}
 		}
 	}
+	verifyTrie(t, &tr)
 }
 
 // TestTrie_FullHashCollision verifies the overflow-chain behavior by forcing
@@ -340,6 +397,7 @@ func TestTrie_ConcurrentStoreLoad(t *testing.T) {
 		}(w)
 	}
 	wg.Wait()
+	verifyTrie(t, &tr)
 }
 
 // TestTrie_ConcurrentSameKey hammers the same key with many goroutines
@@ -379,6 +437,7 @@ func TestTrie_ConcurrentSameKey(t *testing.T) {
 				t.Fatalf("iter %d: worker %d saw entry %p, want %p", iter, i, e, first)
 			}
 		}
+		verifyTrie(t, &tr)
 	}
 }
 
@@ -411,6 +470,7 @@ func TestTrie_ConcurrentDeletePrune(t *testing.T) {
 	if root := tr.root.Load(); !root.empty() {
 		t.Fatal("root not pruned: has surviving children")
 	}
+	verifyTrie(t, &tr)
 }
 
 // TestTrie_RangeDuringMutation runs walk concurrently with store and
@@ -461,6 +521,7 @@ func TestTrie_RangeDuringMutation(t *testing.T) {
 	}
 	stop.Store(true)
 	wg.Wait()
+	verifyTrie(t, &tr)
 }
 
 // TestTrie_DeleteMissingInCollisionChain walks an overflow chain in search
@@ -524,6 +585,7 @@ func TestTrie_DeleteRaceRetries(t *testing.T) {
 			}(w)
 		}
 		wg.Wait()
+		verifyTrie(t, &tr)
 	}
 }
 
@@ -586,6 +648,7 @@ func TestTrie_DeleteRaceAgainstExpand(t *testing.T) {
 				t.Fatalf("round %d: %s missing after delete of a", i, k)
 			}
 		}
+		verifyTrie(t, &tr)
 	}
 }
 
@@ -614,4 +677,5 @@ func TestTrie_DeleteDuringConcurrentStore(t *testing.T) {
 	}
 	stop.Store(true)
 	wg.Wait()
+	verifyTrie(t, &tr)
 }

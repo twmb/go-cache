@@ -873,3 +873,35 @@ func TestClean_DoesNotEvictFreshEntries(t *testing.T) {
 	close(stop)
 	cleanWg.Wait()
 }
+
+// TestExpire_NotLostToIdleExtension verifies that Expire racing an
+// idle-extending read sticks: once both return, the key must be expired.
+//
+// Regression test: idle extension previously used a plain Store on the
+// expiry, which could overwrite a concurrent Expire (read loads expiry,
+// Expire stores now-1, read stores now+idle). Extension now CASes against
+// the expiry it observed, so an interleaved Expire wins.
+func TestExpire_NotLostToIdleExtension(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stress test in -short")
+	}
+	c := New[int, int](MaxIdleAge(time.Hour))
+	const rounds = 100_000
+	for i := range rounds {
+		c.Set(i, 1)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			c.TryGet(i) // a Hit extends the idle expiry
+		}()
+		go func() {
+			defer wg.Done()
+			c.Expire(i)
+		}()
+		wg.Wait()
+		if _, _, s := c.TryGet(i); s.IsHit() {
+			t.Fatalf("round %d: Expire was overwritten by a concurrent idle extension", i)
+		}
+	}
+}

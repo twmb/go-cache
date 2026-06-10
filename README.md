@@ -38,13 +38,22 @@ value can be kept and returned from `Get` during a refresh / if a refresh
 fails. Keys can be manually expired with `Expire`. Internally expired values or
 errors can be occasionally cleaned with `Clean`.
 
-Out of an abundance of paranoia that this code is correct, there are unit
-tests targeting ~99% statement coverage of the cache and trie (the remainder
-being defensive panics at invariant-violation points and two tightly-timed
-race branches that require goroutine interleavings we cannot force from
-userspace). All tests against `sync.Map` are copied into this library and
-used against `cache.Cache`, and a property test compares the cache's behavior
-to a `sync.RWMutex`-guarded `map` oracle over random operation sequences.
+Out of an abundance of paranoia that this code is correct, the test suite
+layers several kinds of verification: unit tests at ~98% statement coverage
+of the cache and trie (the remainder being defensive panics at
+invariant-violation points and race-retry branches that require
+interleavings that cannot be forced from userspace); all of the stdlib
+`sync.Map` tests, copied into this library and run against `cache.Cache`; a
+property test comparing the cache to a `sync.RWMutex`-guarded `map` oracle
+over random operation sequences; a linearizability checker that runs batches
+of concurrent operations against single keys and verifies that a
+real-time-consistent sequential ordering explains every observed return;
+structural validation of the trie (hash placement, overflow chains, parent
+pointers, pruning) after each concurrent stress test; and regression hammers
+for specific interleaving bugs found by audit. CI runs the suite under the
+race detector on both amd64 and arm64 (whose weaker memory ordering
+surfaces reordering bugs that x86 hides), and without it on 32-bit
+linux/386.
 
 This package also provides a cached `Item` and a `Set`. `Item` can be used to
 populate an expensive value once and expire or replace it when needed, similar
