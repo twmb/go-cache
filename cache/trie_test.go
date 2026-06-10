@@ -544,12 +544,13 @@ func TestTrie_DeleteRaceAgainstExpand(t *testing.T) {
 	}
 	// Keys whose hashes match in the top 4 bits but diverge later: they
 	// share a slot at depth 1 and a leaf at depth 2 (via overflow then
-	// expand).
+	// expand). The constants are built by shifting so they fit a uintptr
+	// on both 64-bit and 32-bit platforms.
 	hashes := map[string]uintptr{
-		"a": 0xA000000000000000,
-		"b": 0xA000000000000001,
-		"c": 0xA000000000000002,
-		"d": 0xB000000000000000,
+		"a": 0xA << (ptrBits - 4),
+		"b": 0xA<<(ptrBits-4) | 1,
+		"c": 0xA<<(ptrBits-4) | 2,
+		"d": 0xB << (ptrBits - 4),
 	}
 	for i := range 20_000 {
 		var tr trie[string, int]
