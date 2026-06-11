@@ -874,6 +874,56 @@ func TestClean_DoesNotEvictFreshEntries(t *testing.T) {
 	cleanWg.Wait()
 }
 
+// TestGet_DoesNotRedriveFreshlyFinalizedValue targets the slow-path window
+// between Get's load of prev and entGet's own load of the slot: if the
+// in-flight load it observed finalizes live in that window, Get must return
+// the Hit rather than demote the fresh value to a stale and drive a
+// redundant load. Every round arranges an expired-with-stale entry, races
+// Gets against the first load's release, and asserts the miss function ran
+// exactly once.
+func TestGet_DoesNotRedriveFreshlyFinalizedValue(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping race-iteration test in -short")
+	}
+	for iter := range 2000 {
+		c := New[int, int](MaxAge(time.Hour), MaxStaleAge(time.Hour))
+		c.Set(iter, 1)
+		c.Expire(iter) // expired with a valid self-stale
+
+		// A driving Get returns the stale and runs its miss on a
+		// background goroutine, so completion must be synchronized on:
+		// missDone is closed by the (single) miss, and a redundant
+		// second drive panics on the double close.
+		release := make(chan struct{})
+		missDone := make(chan struct{})
+		miss := func() (int, error) {
+			<-release // closed below; late drivers pass straight through
+			close(missDone)
+			return 2, nil
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			c.Get(iter, miss) // drives the refresh, returns Stale(1)
+		}()
+		go func() {
+			defer wg.Done()
+			runtime.Gosched()
+			close(release)
+		}()
+		// Meanwhile, hammer Gets that race the finalization. None may
+		// drive a second load: each must piggyback the stale or return
+		// the fresh Hit.
+		for range 4 {
+			c.Get(iter, miss)
+		}
+		wg.Wait()
+		<-missDone
+	}
+}
+
 // TestExpire_NotLostToIdleExtension verifies that Expire racing an
 // idle-extending read sticks: once both return, the key must be expired.
 //

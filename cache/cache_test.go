@@ -2,6 +2,7 @@ package cache
 
 import (
 	"errors"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -426,6 +427,20 @@ func TestMaxIdleAge(t *testing.T) {
 		vcheck(t, got[string]{v, err, s}, got[string]{"", nil, Miss})
 	})
 
+	// MaxIdleAge must not resurrect entries that finalize already expired:
+	// with MaxAge(0), caching is disabled entirely and the Get that drives
+	// (or piggybacks on) the load gets a courtesy value, not an
+	// idle-extending access. Regression test: the extension previously
+	// fired on the waited-expired path and revived the value for the idle
+	// window.
+	t.Run("no_resurrect_expired", func(t *testing.T) {
+		c := New[string, string](MaxAge(0), MaxIdleAge(time.Hour))
+		v, err, s := c.Get("foo", func() (string, error) { return "bar", nil })
+		vcheck(t, got[string]{v, err, s}, got[string]{"bar", nil, Miss})
+		v, err, s = c.TryGet("foo")
+		vcheck(t, got[string]{v, err, s}, got[string]{"", nil, Miss})
+	})
+
 	// Range doesn't extend.
 	t.Run("range_no_extend", func(t *testing.T) {
 		const ttl = 200 * time.Millisecond
@@ -443,6 +458,65 @@ func TestMaxIdleAge(t *testing.T) {
 		v, err, s := c.TryGet("foo")
 		vcheck(t, got[string]{v, err, s}, got[string]{"", nil, Miss})
 	})
+}
+
+// TestHugeAges verifies expiry arithmetic saturates rather than wrapping:
+// absurd-but-valid Durations must mean "effectively forever", not "born
+// expired" (or, for Clean, "evict everything").
+func TestHugeAges(t *testing.T) {
+	huge := time.Duration(math.MaxInt64)
+
+	// MaxAge: now + ttl must not wrap negative.
+	{
+		c := New[string, int](MaxAge(huge))
+		c.Set("k", 1)
+		if v, _, s := c.TryGet("k"); !s.IsHit() || v != 1 {
+			t.Fatalf("TryGet under huge MaxAge: v=%d s=%v, want 1 Hit", v, s)
+		}
+	}
+
+	// MaxStaleAge: Clean's expires + staleAge must not wrap negative, and
+	// the stale's own expiry must not be born wrapped.
+	{
+		c := New[string, int](MaxAge(time.Nanosecond), MaxStaleAge(huge))
+		c.Set("k", 1)
+		time.Sleep(time.Millisecond) // main entry expired, stale effectively forever
+		c.Clean()                    // must not evict
+		if v, _, s := c.TryGet("k"); s != Stale || v != 1 {
+			t.Fatalf("TryGet after Clean under huge MaxStaleAge: v=%d s=%v, want 1 Stale", v, s)
+		}
+	}
+
+	// MaxIdleAge: the extension n + idle must not wrap negative.
+	{
+		c := New[string, int](MaxIdleAge(huge))
+		c.Set("k", 1)
+		c.TryGet("k") // a Hit extends; the extension must saturate
+		if v, _, s := c.TryGet("k"); !s.IsHit() || v != 1 {
+			t.Fatalf("TryGet after huge idle extension: v=%d s=%v, want 1 Hit", v, s)
+		}
+	}
+}
+
+// TestClean_RespectsValidStales verifies Clean never removes an entry whose
+// stale is still within its window. Born-expired entries (MaxAge(0) stores
+// the -1 expired sentinel) are the regression case: their MaxAge+MaxStaleAge
+// grace would otherwise anchor at the epoch instead of at the entry, so
+// Clean evicted stales that TryGet was still serving.
+func TestClean_RespectsValidStales(t *testing.T) {
+	c := New[string, int](MaxAge(0), MaxStaleAge(50*time.Millisecond))
+	c.Set("k", 1)
+
+	c.Clean() // stale still valid: must not evict
+	if v, _, s := c.TryGet("k"); s != Stale || v != 1 {
+		t.Fatalf("TryGet after early Clean: v=%d s=%v, want 1 Stale", v, s)
+	}
+
+	time.Sleep(60 * time.Millisecond) // stale now expired
+	c.Clean()                         // must evict
+	if _, _, s := c.TryGet("k"); !s.IsMiss() {
+		t.Fatalf("TryGet after late Clean: s=%v, want Miss", s)
+	}
 }
 
 // TestCompareAndSwapAgreesWithTryGet verifies that CompareAndSwap and

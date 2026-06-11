@@ -61,9 +61,12 @@ type trieIndirect[K comparable, V any] struct {
 }
 
 // trieEntry is a leaf node. The value slot p is an atomic pointer; a nil
-// value slot means the entry is tombstoned but still wired into the trie
-// (callers can atomically replace nil with a fresh value). The overflow
-// chain handles hash-equal keys (full hash collisions).
+// value slot means the entry is tombstoned but still wired into the trie.
+// The cache treats a nil slot as terminal — it never stores a value over
+// one, and re-creates the key as a fresh entry instead (see entDel in
+// cache.go and deleteEntryIf below; resurrecting a tombstone in place
+// would invalidate deleteEntryIf's locked predicate). The overflow chain
+// handles hash-equal keys (full hash collisions).
 type trieEntry[K comparable, V any] struct {
 	trieNode[K, V]
 	overflow atomic.Pointer[trieEntry[K, V]]
