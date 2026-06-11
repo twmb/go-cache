@@ -39,7 +39,7 @@ fails. Keys can be manually expired with `Expire`. Internally expired values or
 errors can be occasionally cleaned with `Clean`.
 
 Out of an abundance of paranoia that this code is correct, the test suite
-layers several kinds of verification: unit tests at ~98% statement coverage
+layers several kinds of verification: unit tests at ~99% statement coverage
 of the cache and trie (the remainder being defensive panics at
 invariant-violation points and race-retry branches that require
 interleavings that cannot be forced from userspace); all of the stdlib

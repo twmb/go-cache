@@ -519,6 +519,79 @@ func TestClean_RespectsValidStales(t *testing.T) {
 	}
 }
 
+// trieEntries counts every entry wired into the trie, including tombstoned
+// shells and entries that are invisible to Range and TryGet.
+func trieEntries[K comparable, V any](c *Cache[K, V]) (n int) {
+	c.t.walk(func(*ent[K, V]) bool { n++; return true })
+	return n
+}
+
+// TestClean_ReclaimsBornExpired verifies Clean's handling of born-expired
+// entries (the expiredBorn sentinel: MaxAge(0) / MaxErrorAge(0)), whose -1
+// expiry word carries no entry-anchored timeline to add the MaxStaleAge
+// grace window to. Reclaim is gated on the stale instead: such an entry is
+// removed exactly when no valid stale remains (i.e. as soon as TryGet
+// reports Miss), regardless of process uptime.
+//
+// Regression test: the grace window used to be computed as
+// satAdd(-1, maxStaleAge), anchoring it at the process epoch — born-expired
+// stale-less entries (error churn under MaxErrorAge(0)) were unreclaimable
+// until process uptime exceeded MaxStaleAge, and forever for huge stale
+// ages.
+func TestClean_ReclaimsBornExpired(t *testing.T) {
+	t.Run("errored_no_stale", func(t *testing.T) {
+		c := New[string, int](MaxErrorAge(0), MaxStaleAge(time.Hour))
+		c.Get("k", func() (int, error) { return 0, errors.New("boom") })
+		if _, _, s := c.TryGet("k"); !s.IsMiss() {
+			t.Fatalf("precondition: errored entry should be invisible, got %v", s)
+		}
+		c.Clean()
+		if n := trieEntries(c); n != 0 {
+			t.Fatalf("Clean left %d dead invisible born-expired entries in the trie", n)
+		}
+	})
+
+	t.Run("huge_stale_age", func(t *testing.T) {
+		c := New[string, int](MaxErrorAge(0), MaxStaleAge(time.Duration(math.MaxInt64)))
+		c.Get("k", func() (int, error) { return 0, errors.New("boom") })
+		if _, _, s := c.TryGet("k"); !s.IsMiss() {
+			t.Fatalf("precondition: errored entry should be invisible, got %v", s)
+		}
+		c.Clean()
+		if n := trieEntries(c); n != 0 {
+			t.Fatalf("Clean left %d dead entries (huge MaxStaleAge made them permanent)", n)
+		}
+	})
+
+	t.Run("keeps_valid_stale", func(t *testing.T) {
+		c := New[string, int](MaxAge(0), MaxStaleAge(time.Hour))
+		c.Set("k", 1) // born expired; stale window anchored at the store
+		if _, _, s := c.TryGet("k"); s != Stale {
+			t.Fatalf("precondition: want Stale, got %v", s)
+		}
+		c.Clean()
+		if v, _, s := c.TryGet("k"); s != Stale || v != 1 {
+			t.Fatalf("Clean evicted a born-expired entry with a valid stale: TryGet=(%d,%v)", v, s)
+		}
+		if n := trieEntries(c); n != 1 {
+			t.Fatalf("trie entries = %d, want 1", n)
+		}
+	})
+
+	t.Run("reclaims_dead_stale", func(t *testing.T) {
+		c := New[string, int](MaxAge(0), MaxStaleAge(5*time.Millisecond))
+		c.Set("k", 1)
+		time.Sleep(10 * time.Millisecond) // stale window passed
+		if _, _, s := c.TryGet("k"); !s.IsMiss() {
+			t.Fatalf("precondition: want Miss, got %v", s)
+		}
+		c.Clean()
+		if n := trieEntries(c); n != 0 {
+			t.Fatalf("Clean left %d entries whose stale window had passed", n)
+		}
+	})
+}
+
 // TestCompareAndSwapAgreesWithTryGet verifies that CompareAndSwap and
 // CompareAndDelete only match live values: expired entries and errored
 // entries are "not there" per TryGet, so comparing against them must fail.

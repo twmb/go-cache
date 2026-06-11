@@ -955,3 +955,109 @@ func TestExpire_NotLostToIdleExtension(t *testing.T) {
 		}
 	}
 }
+
+// TestClean_ClaimWindowDoesNotResurrectDeadStale pins Clean's claim protocol
+// against racing Gets: Clean claims an entry's expiry word before
+// tombstoning, and a Get that lands between the claim and the tombstone
+// snapshots that loading for a stale. The claim must not read as "born
+// expired": entMaybeNewStale would re-anchor the certified-dead stale at now
+// and the Get would serve a value past MaxAge+MaxStaleAge as a fresh Stale
+// for up to another MaxStaleAge.
+//
+// The test performs Clean's claim by hand (same gate, same CAS) so the
+// window between Clean's two CASes is held open deterministically.
+//
+// Regression test: Clean used to claim with -1, the born-expired sentinel,
+// which is exactly what newStale re-anchors.
+func TestClean_ClaimWindowDoesNotResurrectDeadStale(t *testing.T) {
+	c := New[string, int](MaxAge(time.Millisecond), MaxStaleAge(time.Millisecond))
+	c.Set("k", 1)
+	time.Sleep(5 * time.Millisecond) // expired AND past the stale window
+
+	if _, _, s := c.TryGet("k"); !s.IsMiss() {
+		t.Fatalf("precondition: entry should be fully dead, got %v", s)
+	}
+
+	// Clean's claim, by hand: same gate, same CAS, protocol frozen between
+	// Clean's two CASes.
+	e := c.t.loadEntry("k")
+	l := e.p.Load()
+	expires := l.expires.Load()
+	tn := now()
+	if expires <= 0 || tn <= satAdd(expires, int64(c.cfg.maxStaleAge)) ||
+		(l.stale != nil && !l.stale.expired(tn)) {
+		t.Fatalf("precondition: entry not Clean-eligible: expires=%d", expires)
+	}
+	if !l.expires.CompareAndSwap(expires, expiredClaimed) {
+		t.Fatal("claim CAS failed")
+	}
+
+	// A Get in the claim window must not serve the dead value as a stale:
+	// the stale snapshot must come up empty, so the Get blocks on (and
+	// returns) the fresh load.
+	if v, _, s := c.Get("k", func() (int, error) { return 2, nil }); v != 2 || s != Miss {
+		t.Fatalf("Get in Clean's claim window: v=%d s=%v, want 2 Miss (a Stale here resurrects a certified-dead value)", v, s)
+	}
+	if l2 := e.p.Load(); l2 == nil || l2.stale != nil {
+		t.Fatalf("the replacement loading must carry no stale snapshot of the claimed value, got %+v", l2)
+	}
+
+	// Finish Clean's protocol: the tombstone CAS must fail (the Get
+	// replaced the slot) and the fresh value must survive.
+	if e.p.CompareAndSwap(l, nil) {
+		t.Fatal("Clean's tombstone CAS should have failed against the Get's replacement")
+	}
+	if v, _, s := c.TryGet("k"); v != 2 || !s.IsHit() {
+		t.Fatalf("after claim window: TryGet=(%d,%v), want (2,Hit)", v, s)
+	}
+}
+
+// TestClean_ClaimWindowVsGetRace hammers the window between Clean's two
+// CASes (the expiry-word claim and the tombstone) with racing Gets. Every
+// round populates keys whose value AND stale are certifiably dead (TryGet
+// returned Miss), then races a real Clean against a Get scan: any Get that
+// returns Stale resurrected a certified-dead value.
+//
+// Probabilistic tripwire for the protocol pinned deterministically by
+// TestClean_ClaimWindowDoesNotResurrectDeadStale; before Clean claimed with
+// a dedicated sentinel, this fired within a few seconds under -race.
+func TestClean_ClaimWindowVsGetRace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping race-iteration test in -short")
+	}
+	const (
+		keys = 1024
+		// Small enough that entries die within a round's sleep; large
+		// enough that a wrongly re-anchored stale stays observable for the
+		// Get that snapshotted it.
+		staleAge = 5 * time.Millisecond
+	)
+	c := New[int, int](MaxAge(time.Nanosecond), MaxStaleAge(staleAge))
+	miss := func() (int, error) { return 2, nil }
+	for start := time.Now(); time.Since(start) < 3*time.Second; {
+		for k := range keys {
+			c.Set(k, 1)
+		}
+		time.Sleep(staleAge + 2*time.Millisecond)
+		for k := range keys {
+			for {
+				if _, _, s := c.TryGet(k); s.IsMiss() {
+					break // certified: expired and stale dead
+				}
+			}
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.Clean()
+		}()
+		for k := range keys {
+			if v, _, s := c.Get(k, miss); s == Stale {
+				t.Fatalf("key %d: Get racing Clean returned a certified-dead value as a stale: v=%d", k, v)
+			}
+		}
+		wg.Wait()
+	}
+}

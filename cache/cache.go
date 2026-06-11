@@ -103,6 +103,18 @@ const (
 	stateFinalized
 )
 
+// Sentinels for loading.expires beyond 0 (in flight, or once finalized,
+// "never expires"). Positive values are monotonic-clock nanos (see epoch);
+// negative values are expired at every clock sample, since now is always
+// strictly positive. The two negatives are deliberately distinct: newStale
+// re-anchors a born-expired value's stale at now, which must not happen to
+// a value whose stale Clean has already certified dead (see
+// entMaybeNewStale).
+const (
+	expiredBorn    = -1 // newExpires: MaxAge(0) / MaxErrorAge(0), expired at birth
+	expiredClaimed = -2 // Clean's claim: value expired and stale certified dead
+)
+
 // ent is the concrete type of cache entries living in the trie. Using a
 // type alias (Go 1.24+) lets us refer to entries by a short name while the
 // trie stays a generic hash-trie with no cache-specific logic.
@@ -122,9 +134,10 @@ var epoch = time.Now().Add(-time.Second)
 func now() int64 { return int64(time.Since(epoch)) }
 
 // satAdd returns a+b saturated at math.MaxInt64, for expiry arithmetic on
-// nanosecond quantities; b must be non-negative (a may be the -1 expired
-// sentinel). Without saturation, a huge MaxAge / MaxStaleAge / MaxIdleAge
-// would wrap negative and make entries born (or instantly) expired.
+// nanosecond quantities; b must be non-negative, and callers pass a > 0
+// (sentinel expiries are filtered before the math). Without saturation, a
+// huge MaxAge / MaxStaleAge / MaxIdleAge would wrap negative and make
+// entries born (or instantly) expired.
 func satAdd(a, b int64) int64 {
 	if s := a + b; s >= a {
 		return s
@@ -146,7 +159,7 @@ func (cfg *cfg) newExpires(err error) int64 {
 		del0 = cfg.ageSet && cfg.maxAge <= 0
 	}
 	if del0 {
-		return -1
+		return expiredBorn
 	}
 	if ttl == 0 {
 		return 0
@@ -174,9 +187,14 @@ func MaxAge(age time.Duration) Opt { return opt{fn: func(c *cfg) { c.maxAge, c.a
 // value is the previous successfully cached value that is returned while the
 // value is being refreshed (a new value is being queried). As well, the stale
 // value is returned while the refreshed value is erroring. Without MaxAge,
-// stales still apply to manually Expired keys and to erroring refreshes.
+// stales still apply to manually Expired keys and to erroring refreshes;
+// note that until a Get drives a refresh, an Expired key's stale window is
+// anchored at the time the value was stored (a TryGet more than MaxStaleAge
+// after the store finds no stale), while the refresh a Get drives re-anchors
+// the window at the Expire.
 //
-// A special value of -1 allows stale values to be returned indefinitely.
+// A negative value (canonically -1) allows stale values to be returned
+// indefinitely.
 func MaxStaleAge(age time.Duration) Opt { return opt{fn: func(c *cfg) { c.maxStaleAge = age }} }
 
 // MaxErrorAge sets the age to persist load errors. If not specified, the
@@ -198,7 +216,12 @@ func MaxErrorAge(age time.Duration) Opt {
 //
 // The reset is best effort under races: a concurrent Expire, or a Clean
 // that has already deemed the entry expired, wins over an in-flight
-// extension.
+// extension. In the other direction, an extension computed just before the
+// entry's expiry passed can land just after it and briefly revive the entry
+// for another idle window. The clock is re-sampled immediately before an
+// extension is published, so the revival window is a few instructions wide
+// (stretched only by the extending goroutine being descheduled exactly
+// there), but it is not fully closed.
 func MaxIdleAge(age time.Duration) Opt {
 	return opt{fn: func(c *cfg) { c.maxIdleAge = age }}
 }
@@ -359,9 +382,10 @@ outer:
 }
 
 // TryGet returns the value for the given key if it is cached. This returns
-// either the currently stored value, or the current stale if the load errored,
-// or the load error if there is no stale. If nothing is cached, or what is
-// cached is expired, this returns Miss.
+// either the currently stored value, or the current stale if the latest load
+// errored or the value has expired while its stale is still valid, or the
+// load error if there is no stale. If nothing is cached, or what is cached is
+// expired with no valid stale, this returns Miss.
 func (c *Cache[K, V]) TryGet(k K) (v V, err error, _ KeyState) {
 	e := c.t.loadEntry(k)
 	if e == nil {
@@ -436,10 +460,11 @@ func (c *Cache[K, V]) Range(fn func(K, V, error) bool) {
 
 // Clean deletes all expired values from the cache. A value is expired if
 // MaxAge is used and the entry is older than the max age, or if you manually
-// expired a key. If MaxStaleAge is used and not -1, the entry must be older
-// than MaxAge + MaxStaleAge, and an entry whose stale value is still within
-// its window is never removed. If MaxStaleAge is -1, Clean returns
-// immediately.
+// expired a key. If MaxStaleAge is used and not negative, the entry must be
+// older than MaxAge + MaxStaleAge, and an entry whose stale value is still
+// within its window is never removed. Entries that were born expired
+// (MaxAge(0) or MaxErrorAge(0)) are removed as soon as they have no valid
+// stale. If MaxStaleAge is negative, Clean returns immediately.
 //
 // Clean also physically removes entries that were tombstoned by prior Delete
 // calls, so the trie's memory footprint does not grow unboundedly with
@@ -463,22 +488,36 @@ func (c *Cache[K, V]) Clean() {
 			return true
 		}
 		expires := l.expires.Load()
-		// The stale check matters for born-expired entries (MaxAge(0) /
-		// MaxErrorAge(0) store the -1 sentinel): their grace window would
-		// otherwise anchor at the epoch rather than at the entry, evicting
-		// stales that TryGet would still serve. For normally expired
-		// entries the stale dies at expires+maxStaleAge anyway, so the
-		// check changes nothing.
-		if expires != 0 && tn > satAdd(expires, int64(c.cfg.maxStaleAge)) &&
-			(l.stale == nil || l.stale.expired(tn)) {
+		// An entry is reclaimable only once it is invisible to every
+		// read: the value must be expired and any stale must be out of
+		// its window (TryGet would return Miss). The stale check is also
+		// what anchors born-expired entries (MaxAge(0) / MaxErrorAge(0)
+		// store the expiredBorn sentinel): they have no entry-anchored
+		// expiry to add the grace window to — satAdd(-1, maxStaleAge)
+		// would anchor the grace at the process epoch, blocking reclaim
+		// of dead stale-less entries (error churn under MaxErrorAge(0))
+		// until the process itself is older than MaxStaleAge, and forever
+		// for huge stale ages. Their stale, the only birth-anchored
+		// datum, gates them instead: reclaim exactly when TryGet
+		// visibility ends. Entries with a positive expiry keep the usual
+		// entry-anchored MaxAge + MaxStaleAge grace.
+		if expires != 0 && (l.stale == nil || l.stale.expired(tn)) &&
+			(expires < 0 || tn > satAdd(expires, int64(c.cfg.maxStaleAge))) {
 			// Win the expiry word before tombstoning: idle extension
 			// CASes against the expiry it observed, so claiming the
-			// word here (writing the expired sentinel) makes a racing
-			// extension fail — the same way it loses to Expire — rather
-			// than be silently thrown away by our eviction. If instead
-			// the extension wins, the entry is in use; leave it for a
-			// later pass.
-			if l.expires.CompareAndSwap(expires, -1) && e.p.CompareAndSwap(l, nil) {
+			// word here makes a racing extension fail — the same way it
+			// loses to Expire — rather than be silently thrown away by
+			// our eviction. If instead the extension wins, the entry is
+			// in use; leave it for a later pass.
+			//
+			// The claim must be expiredClaimed, not expiredBorn: a
+			// racing Get that snapshots this loading for a stale in the
+			// window between our two CASes would read a -1 word as
+			// "born expired" and re-anchor the (certified dead) stale
+			// at now, serving the dead value as a fresh Stale for up to
+			// another MaxStaleAge. entMaybeNewStale treats a claimed
+			// word as "no stale".
+			if l.expires.CompareAndSwap(expires, expiredClaimed) && e.p.CompareAndSwap(l, nil) {
 				toPrune = append(toPrune, e.key)
 			}
 		}
@@ -511,10 +550,10 @@ func (c *Cache[K, V]) StopAutoClean() {
 }
 
 // Swap sets a value for a key. If the key is currently loading via Get, the
-// load is canceled and Get returns the value from Swap. This returns the
-// previously stored value, or the previous stale if the load errored, or the
-// previous error if there is no stale. If nothing was cached, this returns
-// Miss.
+// load's result is discarded (the miss function itself is not interrupted)
+// and Get returns the value from Swap. This returns the previously stored
+// value, or the previous stale if the load errored, or the previous error if
+// there is no stale. If nothing was cached, this returns Miss.
 func (c *Cache[K, V]) Swap(k K, v V) (old V, oldErr error, oldState KeyState) {
 	l := c.finalizedLoading(v)
 
@@ -616,7 +655,8 @@ func (l *loading[V]) setve(v V, err error, expires int64) {
 }
 
 // Set sets a value for a key. If the key is currently loading via Get, the
-// load is canceled and Get returns the value from Set.
+// load's result is discarded (the miss function itself is not interrupted)
+// and Get returns the value from Set.
 func (c *Cache[K, V]) Set(k K, v V) {
 	c.Swap(k, v)
 }
@@ -697,6 +737,11 @@ func (c *Cache[K, V]) finalizedLoading(v V) *loading[V] {
 			// newStale handles expires <= 0 by basing the stale lifespan
 			// on now, so an infinite-TTL + MaxStaleAge combo produces a
 			// usable (non-epoch-born) stale for manual Expire to surface.
+			// The window is anchored here, at creation: a TryGet more
+			// than MaxStaleAge after this store finds the stale already
+			// dead even if the Expire was recent. A Get-driven
+			// replacement re-snapshots against the Expire's timestamp
+			// (see entMaybeNewStale) and surfaces a fresh window.
 			l.stale = newStale(v, expires, c.cfg.maxStaleAge)
 		}
 	}
@@ -756,6 +801,7 @@ func (s *stale[V]) expired(n int64) bool {
 //   - if no stale age, we are not using stales, return nil
 //   - if the loading is still pending, return nil (no value to snapshot)
 //   - if loading has an error, return the prior stale
+//   - if Clean claimed the loading (value and stale certified dead), return nil
 //   - if age is < 0, return new unexpiring stale
 //   - else, return new stale with prior expiry + stale age
 func entMaybeNewStale[K comparable, V any](e *ent[K, V], age time.Duration) *stale[V] {
@@ -769,15 +815,26 @@ func entMaybeNewStale[K comparable, V any](e *ent[K, V], age time.Duration) *sta
 	if l.err != nil {
 		return l.stale
 	}
-	return newStale(l.v, l.expires.Load(), age)
+	expires := l.expires.Load()
+	if expires == expiredClaimed {
+		// Clean claimed this loading: the value is past its full window
+		// and its stale was certified dead. Without this check the claim
+		// would read as "born expired" below, and newStale would re-anchor
+		// the dead value's stale at now — resurrecting it as a fresh Stale
+		// for up to another MaxStaleAge.
+		return nil
+	}
+	return newStale(l.v, expires, age)
 }
 
 // newStale returns a fresh stale; age must be non-zero.
 //
 // expires is the main entry's expiry nano. If it is <= 0 (either 0 meaning
-// the main entry never expires, or -1 meaning it expired immediately), we
-// base the stale's lifespan on now so the stale is not born expired at the
-// Unix epoch.
+// the main entry never expires, or expiredBorn meaning it expired
+// immediately), we base the stale's lifespan on now so the stale is not born
+// expired at the process epoch. Callers must filter expiredClaimed before
+// calling: a claimed value's stale is certified dead and must not be
+// re-anchored (see entMaybeNewStale).
 func newStale[V any](v V, expires int64, age time.Duration) *stale[V] {
 	if age < 0 {
 		return &stale[V]{v: v}
@@ -840,8 +897,16 @@ func entGet[K comparable, V any](e *ent[K, V], extend time.Duration) (v V, err e
 		// changed, the other writer wins. Never extend an expired entry:
 		// a waited-on load that finalized already expired (MaxAge(0)
 		// collapsing, or a TTL shorter than the load itself) is returned
-		// as a courtesy, not resurrected.
-		l.expires.CompareAndSwap(expires, satAdd(n, int64(extend)))
+		// as a courtesy, not resurrected. The !expired gate evaluated at
+		// n, which may have gone stale if we were descheduled since: a
+		// CAS landing after the expiry passed would revive an entry that
+		// concurrent readers may have already reported as Miss. Re-sample
+		// the clock immediately before publishing; the instructions
+		// between this sample and the CAS remain best effort (see
+		// MaxIdleAge).
+		if now() < expires {
+			l.expires.CompareAndSwap(expires, satAdd(n, int64(extend)))
+		}
 	}
 	return l.v, l.err, Hit
 }
@@ -896,9 +961,13 @@ func loadingTryGet[V any](l *loading[V], n64 int64, extend time.Duration) (v V, 
 	if extend > 0 && l.err == nil {
 		// CAS so a concurrent Expire is not silently overwritten; see the
 		// matching comment in entGet. This path is unreachable when
-		// expired (the branch above returns), so unlike entGet no
-		// explicit !expired gate is needed.
-		l.expires.CompareAndSwap(expires, satAdd(n, int64(extend)))
+		// expired at n (the branch above returns), so unlike entGet no
+		// explicit !expired gate is needed — but n may have gone stale if
+		// we were descheduled since it was sampled, so re-sample the
+		// clock immediately before publishing, as in entGet.
+		if now() < expires {
+			l.expires.CompareAndSwap(expires, satAdd(n, int64(extend)))
+		}
 	}
 	return l.v, l.err, Hit
 }
@@ -932,10 +1001,11 @@ func (i *Item[V]) Get(miss func() (V, error)) (v V, err error, state KeyState) {
 	return i.c.Get(struct{}{}, miss)
 }
 
-// TryGet returns the value the item if it is cached. This returns either the
-// currently loaded value, or the current stale if the load errored, or the
-// load error if there is no stale. If nothing is cached, or what is cached is
-// expired, this returns Miss.
+// TryGet returns the item's value if it is cached. This returns either the
+// currently loaded value, or the current stale if the latest load errored or
+// the value has expired while its stale is still valid, or the load error if
+// there is no stale. If nothing is cached, or what is cached is expired with
+// no valid stale, this returns Miss.
 func (i *Item[V]) TryGet() (v V, err error, state KeyState) {
 	return i.c.TryGet(struct{}{})
 }
@@ -958,13 +1028,15 @@ func (i *Item[V]) Expire() {
 }
 
 // Set sets the value for the item. If the item is currently loading via Get,
-// the load is canceled and Get returns the value from Set.
+// the load's result is discarded (the miss function itself is not
+// interrupted) and Get returns the value from Set.
 func (i *Item[V]) Set(v V) {
 	i.c.Set(struct{}{}, v)
 }
 
-// Swap sets the value for the item. If the item is currently loading via Get,
-// the load is canceled and Get returns the value from Set. This returns the
+// Swap sets the value for the item. If the item is currently loading via
+// Get, the load's result is discarded (the miss function itself is not
+// interrupted) and Get returns the value from Swap. This returns the
 // previously stored value, or the previous stale if the load errored, or the
 // previous error if there is no stale. If nothing is cached, this returns
 // Miss.
@@ -993,8 +1065,11 @@ func (i *Item[V]) Clear() {
 
 // Clean deletes the item if it is expired. The item is expired if MaxAge is
 // used and the item is older than the max age, or if you manually expired
-// it. If MaxStaleAge is used and not -1, the item must be older than MaxAge
-// + MaxStaleAge. If MaxStaleAge is -1, Clean returns immediately.
+// it. If MaxStaleAge is used and not negative, the item must be older than
+// MaxAge + MaxStaleAge, and an item whose stale value is still within its
+// window is never removed. An item that was born expired (MaxAge(0) or
+// MaxErrorAge(0)) is removed as soon as it has no valid stale. If
+// MaxStaleAge is negative, Clean returns immediately.
 func (i *Item[V]) Clean() {
 	i.c.Clean()
 }
@@ -1038,9 +1113,10 @@ func (s *Set[K]) Get(k K, miss func() error) (err error, state KeyState) {
 }
 
 // TryGet returns the cached state for the given key: nil if the key loaded
-// successfully, a stale nil if the latest load errored but a valid stale
-// exists, or the load error itself. If nothing is cached, or what is cached
-// is expired, this returns Miss.
+// successfully, a stale nil if a valid stale exists while the latest load
+// errored or the key expired, or the load error itself. If nothing is
+// cached, or what is cached is expired with no valid stale, this returns
+// Miss.
 func (s *Set[K]) TryGet(k K) (err error, state KeyState) {
 	_, err, state = s.c.TryGet(k)
 	return err, state
@@ -1071,16 +1147,20 @@ func (s *Set[K]) Range(fn func(K, error) bool) {
 	})
 }
 
-// Clean deletes all expired keys from the cache. A key is expired if MaxAge is
-// used and the key is older than the max age, or if you manually expired a
-// key. If MaxStaleAge is used and not -1, the entry must be older than MaxAge
-// + MaxStaleAge. If MaxStaleAge is -1, Clean returns immediately.
+// Clean deletes all expired keys from the cache. A key is expired if MaxAge
+// is used and the key is older than the max age, or if you manually expired
+// a key. If MaxStaleAge is used and not negative, the entry must be older
+// than MaxAge + MaxStaleAge, and an entry whose stale value is still within
+// its window is never removed. Entries that were born expired (MaxAge(0) or
+// MaxErrorAge(0)) are removed as soon as they have no valid stale. If
+// MaxStaleAge is negative, Clean returns immediately.
 func (s *Set[K]) Clean() {
 	s.c.Clean()
 }
 
-// Set sets a key to exist. If the key is currently loading via Get,
-// the load is canceled and Get returns nil.
+// Set sets a key to exist. If the key is currently loading via Get, the
+// load's result is discarded (the miss function itself is not interrupted)
+// and Get returns nil.
 func (s *Set[K]) Set(k K) {
 	s.c.Set(k, struct{}{})
 }
