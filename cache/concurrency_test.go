@@ -1215,3 +1215,147 @@ func TestGet_CollapsedErrorWaitersRedrive(t *testing.T) {
 		t.Fatalf("miss ran %d times for %d collapsed Gets; with errors uncached, every Get drives exactly one load", n, waiters)
 	}
 }
+
+// armExpiresPairingHook installs expiresPairingHook such that exactly the
+// first read to pass through it blocks until release is closed; all later
+// reads pass straight through. The hook is cleared when the test ends.
+func armExpiresPairingHook(t *testing.T) (entered, release chan struct{}) {
+	t.Helper()
+	entered = make(chan struct{})
+	release = make(chan struct{})
+	var fired atomic.Bool
+	expiresPairingHook = func() {
+		if fired.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+	}
+	t.Cleanup(func() { expiresPairingHook = nil })
+	return entered, release
+}
+
+// TestTryGet_PairedReadVsIdleExtension pins the coherence of the (expiry
+// word, clock) pair a read classifies with: a reader descheduled between
+// loading the word and sampling the clock, with an idle extension landing
+// in that window, would otherwise classify the dead pre-extension word at
+// a fresh clock and report Stale (with MaxStaleAge) or Miss (without) for
+// an entry that was live at every instant of its call — and a later TryGet
+// returns Hit with no intervening write, a history no sequential order
+// explains. expiresNow re-confirms the word after sampling the clock, so
+// the read classifies the extended (live) word instead.
+//
+// The hook holds the deschedule window open deterministically, like the
+// hand-driven claim-window tests above.
+//
+// Regression test: loadingTryGet and entGet used to classify whatever word
+// they loaded first at whatever clock they sampled next.
+func TestTryGet_PairedReadVsIdleExtension(t *testing.T) {
+	const ttl = 100 * time.Millisecond
+	for _, tt := range []struct {
+		name string
+		opts []Opt
+	}{
+		{"no_stale_age", []Opt{MaxAge(ttl), MaxIdleAge(time.Hour)}},
+		{"with_stale_age", []Opt{MaxAge(ttl), MaxIdleAge(time.Hour), MaxStaleAge(time.Hour)}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := New[string, int](tt.opts...)
+			c.Set("k", 1)
+
+			entered, release := armExpiresPairingHook(t)
+			type res struct {
+				v int
+				s KeyState
+			}
+			r1c := make(chan res, 1)
+			go func() {
+				v, _, s := c.TryGet("k") // loads the initial expiry, parks in the hook
+				r1c <- res{v, s}
+			}()
+			<-entered
+
+			// A second TryGet (the hook is one-shot) hits and extends the
+			// entry to ~now+1h; the entry is now live well past the
+			// original expiry.
+			if v, _, s := c.TryGet("k"); s != Hit || v != 1 {
+				t.Fatalf("extending TryGet: (%d, %v), want (1, Hit)", v, s)
+			}
+			// Let real time pass the original expiry while the first
+			// reader is still parked between its two loads.
+			time.Sleep(ttl + 50*time.Millisecond)
+			close(release)
+			r1 := <-r1c
+
+			if v, _, s := c.TryGet("k"); s != Hit || v != 1 {
+				t.Fatalf("entry must still be live after the extension: (%d, %v)", v, s)
+			}
+			if r1.s != Hit || r1.v != 1 {
+				t.Fatalf("paired read returned (%d, %v) for an entry that was live throughout its call, want (1, Hit)", r1.v, r1.s)
+			}
+		})
+	}
+}
+
+// TestTryGet_PairedReadVsExpire pins the safe direction of the same window:
+// otherwise the word only ever moves backward (Expire, Clean's claim), and
+// a parked reader lands on one side of the race or the other — Hit per the
+// pre-Expire live word (its call overlaps the Expire, so ordering the read
+// first explains the history) or Miss per the expired word. Whichever side
+// it lands on, no stale is conjured for an entry with no stale configured.
+func TestTryGet_PairedReadVsExpire(t *testing.T) {
+	c := New[string, int](MaxAge(time.Hour))
+	c.Set("k", 1)
+
+	entered, release := armExpiresPairingHook(t)
+	type res struct {
+		v int
+		s KeyState
+	}
+	r1c := make(chan res, 1)
+	go func() {
+		v, _, s := c.TryGet("k")
+		r1c <- res{v, s}
+	}()
+	<-entered
+
+	c.Expire("k") // moves the word backward while the reader is parked
+	close(release)
+	r1 := <-r1c
+
+	if r1.s == Stale {
+		t.Fatalf("no stale is configured; got (%d, %v)", r1.v, r1.s)
+	}
+	if _, _, s := c.TryGet("k"); !s.IsMiss() {
+		t.Fatalf("after Expire: %v, want Miss", s)
+	}
+}
+
+// TestSwap_OverBornExpired pins the born-expired classification cell of
+// Swap's displaced-value report against TryGet: a displaced born-expired
+// value (negated-birth expiry word) is the prior value (Stale) while its
+// birth-anchored window is open, and Miss after — exactly as TryGet
+// reports the same state.
+func TestSwap_OverBornExpired(t *testing.T) {
+	t.Run("window_open", func(t *testing.T) {
+		c := New[string, int](MaxAge(0), MaxStaleAge(time.Hour))
+		c.Set("k", 1)
+		if v, _, s := c.TryGet("k"); s != Stale || v != 1 {
+			t.Fatalf("TryGet: (%d, %v), want (1, Stale)", v, s)
+		}
+		old, oldErr, oldS := c.Swap("k", 2)
+		if oldS != Stale || old != 1 || oldErr != nil {
+			t.Fatalf("Swap: (%d, %v, %v), want (1, nil, Stale) to agree with TryGet", old, oldErr, oldS)
+		}
+	})
+	t.Run("window_closed", func(t *testing.T) {
+		c := New[string, int](MaxAge(0), MaxStaleAge(30*time.Millisecond))
+		c.Set("k", 1)
+		time.Sleep(60 * time.Millisecond)
+		if _, _, s := c.TryGet("k"); !s.IsMiss() {
+			t.Fatalf("TryGet: %v, want Miss", s)
+		}
+		if _, _, oldS := c.Swap("k", 2); oldS != Miss {
+			t.Fatalf("Swap: %v, want Miss to agree with TryGet", oldS)
+		}
+	})
+}

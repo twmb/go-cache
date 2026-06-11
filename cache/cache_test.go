@@ -3,6 +3,7 @@ package cache
 import (
 	"errors"
 	"math"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -749,6 +750,132 @@ func TestExpire_StaleWindowAnchorsAtExpire(t *testing.T) {
 	time.Sleep(2 * age)
 	if _, _, s := c.TryGet("k"); !s.IsMiss() {
 		t.Fatalf("TryGet after the post-Expire window: %v, want Miss", s)
+	}
+}
+
+// TestExpire_MidWindowDoesNotReanchor verifies Expire is a no-op on an
+// entry that is expired but still inside its stale window: the expiry word
+// (the window's anchor) must be byte-identical after the call.
+// TestExpire_DoesNotResurrectDeadStale covers the window-already-closed
+// case; here a forward re-anchor would extend a dead value's servable life
+// mid-window.
+func TestExpire_MidWindowDoesNotReanchor(t *testing.T) {
+	t.Run("ttl_expired", func(t *testing.T) {
+		c := New[string, int](MaxAge(20*time.Millisecond), MaxStaleAge(time.Hour))
+		c.Set("k", 1)
+		time.Sleep(40 * time.Millisecond) // expired; window open for ~1h
+		if _, _, s := c.TryGet("k"); s != Stale {
+			t.Fatalf("precondition: want Stale, got %v", s)
+		}
+		l := c.t.loadEntry("k").p.Load()
+		w0 := l.expires.Load()
+		c.Expire("k")
+		if w1 := l.expires.Load(); w1 != w0 {
+			t.Fatalf("Expire moved an already-expired word: %d -> %d (re-anchors the stale window)", w0, w1)
+		}
+	})
+	t.Run("born_expired", func(t *testing.T) {
+		c := New[string, int](MaxAge(0), MaxStaleAge(time.Hour))
+		c.Set("k", 1) // word carries the negated birth
+		if _, _, s := c.TryGet("k"); s != Stale {
+			t.Fatalf("precondition: want Stale, got %v", s)
+		}
+		l := c.t.loadEntry("k").p.Load()
+		w0 := l.expires.Load()
+		if w0 >= 0 {
+			t.Fatalf("precondition: want a negated-birth word, got %d", w0)
+		}
+		c.Expire("k")
+		if w1 := l.expires.Load(); w1 != w0 {
+			t.Fatalf("Expire destroyed the birth anchor: %d -> %d", w0, w1)
+		}
+	})
+}
+
+// TestClean_KeepsExpiredErrorWithValidCompanion pins Clean's gate for
+// errored entries: an expired error whose refresh companion (the previous
+// generation) is still inside its window is visible to reads — TryGet
+// serves the companion — so Clean must not reclaim it.
+func TestClean_KeepsExpiredErrorWithValidCompanion(t *testing.T) {
+	c := New[string, int](MaxStaleAge(time.Hour), MaxErrorAge(20*time.Millisecond))
+	c.Set("k", 1)
+	c.Expire("k")
+	// Drive a refresh that errors; the new loading carries companion=1.
+	c.Get("k", func() (int, error) { return 0, errors.New("boom") })
+	e := c.t.loadEntry("k")
+	for l := e.p.Load(); l == nil || !l.finalized(); l = e.p.Load() {
+		runtime.Gosched()
+	}
+	time.Sleep(40 * time.Millisecond) // error now expired; companion valid ~1h
+
+	if v, _, s := c.TryGet("k"); s != Stale || v != 1 {
+		t.Fatalf("precondition: TryGet=(%d,%v), want (1, Stale) via the companion", v, s)
+	}
+	c.Clean()
+	if v, _, s := c.TryGet("k"); s != Stale || v != 1 {
+		t.Fatalf("Clean reclaimed an entry whose companion was still servable: TryGet=(%d,%v)", v, s)
+	}
+	if n := trieEntries(c); n != 1 {
+		t.Fatalf("trie entries = %d, want 1", n)
+	}
+}
+
+// TestStale_WindowBoundaries drives the exact-nanosecond boundaries of the
+// derived stale window through loadingTryGet with hand-picked clocks (the
+// n64 parameter pins the clock deterministically, exactly as Range and
+// Delete do) and checks the window definitions agree bit-for-bit across
+// the read path (staleOpen), the refresh companion (newStale), and
+// stale.expired: the window is [expiry, expiry+age), half-open at every
+// site, for positive, negated-birth, and claimed words.
+func TestStale_WindowBoundaries(t *testing.T) {
+	const age = 100 * time.Millisecond
+	a := int64(age)
+	c := New[string, int](MaxAge(time.Hour), MaxStaleAge(age))
+	c.Set("k", 1)
+	l := c.t.loadEntry("k").p.Load()
+
+	check := func(n int64, wantS KeyState, wantV int, what string) {
+		t.Helper()
+		v, _, s := loadingTryGet(l, n, 0, age)
+		if s != wantS || (wantS != Miss && v != wantV) {
+			t.Fatalf("%s: loadingTryGet=(%d,%v), want (%d,%v)", what, v, s, wantV, wantS)
+		}
+	}
+
+	// Positive word: expiry E, window [E, E+age).
+	E := now() - 1
+	l.expires.Store(E)
+	check(E-1, Hit, 1, "one ns before expiry")
+	check(E, Stale, 1, "the expiry instant itself")
+	check(E+a-1, Stale, 1, "last open ns of the window")
+	check(E+a, Miss, 0, "the window-close instant")
+
+	if st := newStale(1, E, age); st.expires != E+a {
+		t.Fatalf("companion window end %d != read-path window end %d", st.expires, E+a)
+	} else if st.expired(E+a-1) || !st.expired(E+a) {
+		t.Fatal("companion boundary disagrees with the read-path boundary")
+	}
+	if !staleOpen(E, E+a-1, age) || staleOpen(E, E+a, age) {
+		t.Fatal("staleOpen boundary inconsistent with itself")
+	}
+
+	// Negated-birth word: anchor B, window [B, B+age).
+	B := now()
+	l.expires.Store(-B)
+	check(B+a-1, Stale, 1, "born-expired: last open ns")
+	check(B+a, Miss, 0, "born-expired: window-close instant")
+	if st := newStale(1, -B, age); st.expires != B+a {
+		t.Fatalf("born-expired companion end %d, want %d", st.expires, B+a)
+	}
+
+	// Claimed word: no window, ever; and no companion may be derived.
+	l.expires.Store(expiredClaimed)
+	check(B, Miss, 0, "claimed word")
+	if staleOpen(expiredClaimed, 1, age) {
+		t.Fatal("staleOpen derived a window from a claimed word")
+	}
+	if st := entMaybeNewStale(c.t.loadEntry("k"), age); st != nil {
+		t.Fatalf("entMaybeNewStale snapshotted a claimed loading: %+v", st)
 	}
 }
 

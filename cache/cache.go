@@ -246,9 +246,11 @@ func MaxErrorAge(age time.Duration) Opt {
 // MaxIdleAge opts in to extending an entry's expiry on each successful
 // access. Each time Get or TryGet returns a live Hit without an error, the
 // entry's expiry is reset to now + age. If MaxAge is not set, the idle
-// age is also used as the initial TTL. The reset applies in both
-// directions: with MaxIdleAge smaller than MaxAge, an access shortens the
-// entry's remaining life from the MaxAge-given expiry to now + age.
+// age is also used as the initial TTL. A non-positive age is ignored
+// entirely: no extension occurs, and no initial TTL is derived from it.
+// The reset applies in both directions: with MaxIdleAge smaller than
+// MaxAge, an access shortens the entry's remaining life from the
+// MaxAge-given expiry to now + age.
 //
 // The reset is best effort under races: a concurrent Expire, or a Clean
 // that has already deemed the entry expired, wins over an in-flight
@@ -479,7 +481,9 @@ func (c *Cache[K, V]) Delete(k K) (v V, err error, _ KeyState) {
 // complete with its normal TTL and is not canceled or shortened. Expiring an
 // already-expired entry is also a no-op: the expiry is never moved forward,
 // so a dead value's stale window cannot be re-anchored or revived, and a
-// concurrent Clean's claim is never overwritten.
+// concurrent Clean's claim is never overwritten. (An Expire that races the
+// entry's natural death can land just after it and trim the dead value's
+// remaining stale window; the window only ever shrinks, never grows.)
 func (c *Cache[K, V]) Expire(k K) {
 	e := c.t.loadEntry(k)
 	if e == nil {
@@ -651,28 +655,10 @@ func (c *Cache[K, V]) Swap(k K, v V) (old V, oldErr error, oldState KeyState) {
 			}
 			was.mu.Unlock()
 		}
-		// Mirror loadingTryGet's classification so the displaced value is
-		// reported exactly as a TryGet at wasN would have reported it: a
-		// valid companion stale outranks an error, an unexpired error is
-		// itself the cached result, and an expired err-free value is
-		// still the prior value (Stale) while its derived window is open.
-		expires := was.expires.Load()
-		expired := expires != 0 && expires <= n
-		if was.err != nil {
-			if was.stale != nil && !was.stale.expired(n) {
-				old, oldState = was.stale.v, Stale
-			} else if !expired {
-				old, oldErr, oldState = was.v, was.err, Hit
-			}
-			return
-		}
-		if expired {
-			if staleOpen(expires, n, c.cfg.maxStaleAge) {
-				old, oldState = was.v, Stale
-			}
-			return
-		}
-		old, oldErr, oldState = was.v, was.err, Hit
+		// The displaced value is reported exactly as a TryGet at wasN
+		// would have reported it: classifyFinalized is the one
+		// classification every read shares.
+		old, oldErr, oldState = classifyFinalized(was, was.expires.Load(), n, c.cfg.maxStaleAge)
 	}()
 
 	// Fast path: if the entry already exists with a live value, CAS the
@@ -943,6 +929,63 @@ func newStale[V any](v V, expires int64, age time.Duration) *stale[V] {
 	return &stale[V]{v, satAdd(expires, int64(age))}
 }
 
+// expiresPairingHook, if non-nil, runs in expiresNow between the expiry
+// load and the clock sample, so tests can deterministically hold a reader
+// descheduled in that window. Never set in production code.
+var expiresPairingHook func()
+
+// expiresNow returns the loading's expiry word and a clock sample forming a
+// coherent pair. The word is loaded before the clock is sampled: Expire
+// CASes in now()-1 from its own clock, which can be ahead of a clock
+// sampled before our load, so sampling after the load guarantees a
+// concurrent Expire is classified as expired rather than extended over. The
+// word is then confirmed after the sample: an idle extension landing
+// between the two would otherwise pair the dead pre-extension word with a
+// fresh clock, misreporting an entry that is live for this entire call as
+// Stale or Miss. Each retry re-loads before re-sampling, preserving the
+// Expire ordering.
+func (l *loading[V]) expiresNow() (expires, n int64) {
+	expires = l.expires.Load()
+	if expiresPairingHook != nil {
+		expiresPairingHook()
+	}
+	for {
+		n = now()
+		if again := l.expires.Load(); again != expires {
+			expires = again
+			continue
+		}
+		return expires, n
+	}
+}
+
+// classifyFinalized reports a finalized loading exactly as a read at clock
+// n does: a valid companion stale (the previous generation) outranks an
+// error; with no companion, an unexpired error is itself the cached result
+// and a dead error is a miss; an expired err-free value is served as Stale
+// while its derived window is open (see staleOpen) and is a miss after.
+// entGet, loadingTryGet, and Swap's displaced-value report all share this
+// classification, so every read and every report agree by construction.
+func classifyFinalized[V any](l *loading[V], expires, n int64, staleAge time.Duration) (v V, err error, state KeyState) {
+	expired := expires != 0 && expires <= n
+	if l.err != nil {
+		if l.stale != nil && !l.stale.expired(n) {
+			return l.stale.v, nil, Stale
+		}
+		if !expired {
+			return l.v, l.err, Hit
+		}
+		return v, err, state
+	}
+	if expired {
+		if staleOpen(expires, n, staleAge) {
+			return l.v, nil, Stale
+		}
+		return v, err, state
+	}
+	return l.v, l.err, Hit
+}
+
 // entGet returns the value, the stale value, or — after waiting on an
 // in-flight load — whatever the load produced. When we waited, expiry alone
 // does not force a miss: Get must hand its caller something even if the
@@ -962,47 +1005,25 @@ func entGet[K comparable, V any](e *ent[K, V], extend, staleAge time.Duration) (
 		waited = true
 	}
 
-	// The expiry must be loaded before the clock is sampled: Expire CASes
-	// in now()-1 from its own clock, which can be ahead of a clock sampled
-	// before our load; sampling after the load guarantees a concurrent
-	// Expire is classified as expired here rather than extended over.
-	expires := l.expires.Load()
-	n := now()
+	expires, n := l.expiresNow()
 	expired := expires != 0 && expires <= n
-	if l.err != nil {
-		// Errored: a valid companion stale (the previous generation)
-		// outranks the error; with no companion, the error itself is the
-		// cached result while it lives, and a dead error is a miss.
-		if l.stale != nil && !l.stale.expired(n) {
-			return l.stale.v, nil, Stale
-		}
-		if !expired {
-			return l.v, l.err, Hit
-		}
-		return v, err, state
-	}
-	if expired {
-		// If we waited, the load could finalize already expired (MaxAge(0)
+	if waited && l.err == nil && expired {
+		// We waited and the load finalized already expired (MaxAge(0)
 		// collapsing, or a TTL shorter than the load itself): hand back
-		// the now-expired value as a courtesy rather than re-drive.
-		// Otherwise the expired value is served as Stale while its
-		// derived window is open (see staleOpen), and is a miss after.
-		if waited {
-			return l.v, nil, Hit
-		}
-		if staleOpen(expires, n, staleAge) {
-			return l.v, nil, Stale
-		}
-		return v, err, state
+		// the now-expired value as a courtesy rather than re-drive. The
+		// courtesy is not an idle-extending access; the value is
+		// returned, not resurrected.
+		return l.v, nil, Hit
 	}
-	if extend > 0 {
+	v, err, state = classifyFinalized(l, expires, n, staleAge)
+	if extend > 0 && state == Hit && l.err == nil {
 		// Extend the idle expiry via CAS against the expiry we evaluated
 		// above so that a concurrent Expire (or Swap finalization, or a
 		// Clean eviction) is not silently overwritten; if expires
-		// changed, the other writer wins. This path is structurally
-		// unexpired at n — a waited-on load that finalized already
-		// expired was returned above as a courtesy, not resurrected —
-		// but n may have gone stale if we were descheduled since it was
+		// changed, the other writer wins. An err-free Hit is structurally
+		// unexpired at n (a waited-on load that finalized already expired
+		// was returned above as a courtesy, never reaching here), but n
+		// may have gone stale if we were descheduled since it was
 		// sampled: a CAS landing after the expiry passed would revive an
 		// entry that concurrent readers may have already reported as
 		// Miss. Re-sample the clock immediately before publishing; the
@@ -1012,7 +1033,7 @@ func entGet[K comparable, V any](e *ent[K, V], extend, staleAge time.Duration) (
 			l.expires.CompareAndSwap(expires, satAdd(n, int64(extend)))
 		}
 	}
-	return l.v, l.err, Hit
+	return v, err, state
 }
 
 func entTryGet[K comparable, V any](e *ent[K, V], n64 int64, extend, staleAge time.Duration) (v V, err error, state KeyState) {
@@ -1043,47 +1064,27 @@ func loadingTryGet[V any](l *loading[V], n64 int64, extend, staleAge time.Durati
 		return v, err, state
 	}
 
-	// The expiry must be loaded before the clock is sampled (when we are
-	// the one sampling it); see the matching comment in entGet. A caller-
-	// provided n64 (Range's batch timestamp, Delete's pre-removal clock)
-	// never extends, so the ordering does not matter there.
-	expires := l.expires.Load()
+	var expires int64
 	if n64 == 0 {
-		n64 = now()
+		expires, n64 = l.expiresNow()
+	} else {
+		// A caller-provided n64 (Range's batch timestamp, Delete's
+		// pre-removal clock) predates this load of the word, so the
+		// stale-word hazard expiresNow guards against cannot arise; the
+		// caller pins its snapshot to n64 and never extends.
+		expires = l.expires.Load()
 	}
 	n := n64
-	expired := expires != 0 && expires <= n
-	if l.err != nil {
-		// Errored: a valid companion stale (the previous generation)
-		// outranks the error; with no companion, the error itself is the
-		// cached result while it lives, and a dead error is a miss.
-		if l.stale != nil && !l.stale.expired(n) {
-			return l.stale.v, nil, Stale
-		}
-		if expired {
-			return v, err, state
-		}
-		return l.v, l.err, Hit
-	}
-	if expired {
-		// An expired value is served as Stale while its derived window
-		// is open (see staleOpen), and is a miss after.
-		if staleOpen(expires, n, staleAge) {
-			return l.v, nil, Stale
-		}
-		return v, err, state
-	}
-	if extend > 0 {
+	v, err, state = classifyFinalized(l, expires, n, staleAge)
+	if extend > 0 && state == Hit && l.err == nil {
 		// CAS so a concurrent Expire is not silently overwritten; see the
-		// matching comment in entGet. This path is structurally unexpired
-		// at n (the branch above returns) — but n may have gone stale if
-		// we were descheduled since it was sampled, so re-sample the
-		// clock immediately before publishing, as in entGet.
+		// matching comment in entGet, including the pre-publish clock
+		// re-sample.
 		if now() < expires {
 			l.expires.CompareAndSwap(expires, satAdd(n, int64(extend)))
 		}
 	}
-	return l.v, l.err, Hit
+	return v, err, state
 }
 
 //////////
