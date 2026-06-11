@@ -959,16 +959,18 @@ func TestExpire_NotLostToIdleExtension(t *testing.T) {
 // TestClean_ClaimWindowDoesNotResurrectDeadStale pins Clean's claim protocol
 // against racing Gets: Clean claims an entry's expiry word before
 // tombstoning, and a Get that lands between the claim and the tombstone
-// snapshots that loading for a stale. The claim must not read as "born
-// expired": entMaybeNewStale would re-anchor the certified-dead stale at now
-// and the Get would serve a value past MaxAge+MaxStaleAge as a fresh Stale
-// for up to another MaxStaleAge.
+// snapshots that loading for a stale. The claimed word must read as "stale
+// window certified closed" — never as something a stale window can be
+// derived from — or the Get would serve a value past MaxAge+MaxStaleAge as
+// a fresh Stale for up to another MaxStaleAge.
 //
 // The test performs Clean's claim by hand (same gate, same CAS) so the
 // window between Clean's two CASes is held open deterministically.
 //
 // Regression test: Clean used to claim with -1, the born-expired sentinel,
-// which is exactly what newStale re-anchors.
+// which newStale then re-anchored at now (born-expired words now carry
+// their birth and anchor there, and a claimed word derives no window at
+// all).
 func TestClean_ClaimWindowDoesNotResurrectDeadStale(t *testing.T) {
 	c := New[string, int](MaxAge(time.Millisecond), MaxStaleAge(time.Millisecond))
 	c.Set("k", 1)
@@ -984,8 +986,9 @@ func TestClean_ClaimWindowDoesNotResurrectDeadStale(t *testing.T) {
 	l := e.p.Load()
 	expires := l.expires.Load()
 	tn := now()
-	if expires <= 0 || tn <= satAdd(expires, int64(c.cfg.maxStaleAge)) ||
-		(l.stale != nil && !l.stale.expired(tn)) {
+	if expired := expires != 0 && expires <= tn; !expired ||
+		(l.stale != nil && !l.stale.expired(tn)) ||
+		(l.err == nil && staleOpen(expires, tn, c.cfg.maxStaleAge)) {
 		t.Fatalf("precondition: entry not Clean-eligible: expires=%d", expires)
 	}
 	if !l.expires.CompareAndSwap(expires, expiredClaimed) {
@@ -1059,5 +1062,156 @@ func TestClean_ClaimWindowVsGetRace(t *testing.T) {
 			}
 		}
 		wg.Wait()
+	}
+}
+
+// TestExpire_DoesNotOverwriteCleanClaim pins Expire against Clean's claim
+// window: once Clean has claimed an entry's expiry word (certifying the
+// value expired and its stale window closed), a racing Expire must leave
+// the claim in place — never replace it with a fresh timestamp that a Get
+// in the window could re-derive a stale window from. Same hand-driven
+// protocol as TestClean_ClaimWindowDoesNotResurrectDeadStale.
+//
+// Regression test: Expire used to blindly store now()-1 over any finalized
+// word, including expiredClaimed; a Get between Clean's two CASes then
+// served the certified-dead value as a fresh Stale.
+func TestExpire_DoesNotOverwriteCleanClaim(t *testing.T) {
+	c := New[string, int](MaxAge(time.Millisecond), MaxStaleAge(time.Millisecond))
+	c.Set("k", 1)
+	time.Sleep(5 * time.Millisecond) // expired AND past the stale window
+
+	if _, _, s := c.TryGet("k"); !s.IsMiss() {
+		t.Fatalf("precondition: entry should be fully dead, got %v", s)
+	}
+
+	e := c.t.loadEntry("k")
+	l := e.p.Load()
+	expires := l.expires.Load()
+	if !l.expires.CompareAndSwap(expires, expiredClaimed) { // Clean's claim
+		t.Fatal("claim CAS failed")
+	}
+
+	c.Expire("k") // lands between Clean's two CASes; must be a no-op
+
+	if got := l.expires.Load(); got != expiredClaimed {
+		t.Fatalf("Expire overwrote Clean's claim: expires=%d, want expiredClaimed", got)
+	}
+	if v, _, s := c.Get("k", func() (int, error) { return 2, nil }); v != 2 || s != Miss {
+		t.Fatalf("Get in the claim window: (%d, %v), want (2, Miss)", v, s)
+	}
+}
+
+// TestSwap_OverFinalizedErroredWithStale is TestSwap_OverErroredWithStale
+// with the race pinned the other way: the errored load has finalized by
+// the time Swap displaces it. The classification must agree with TryGet:
+// the valid stale, not the error, is the prior value.
+//
+// Regression test: the defer's finalized classification used to assign the
+// stale and then fall through to overwrite it with (v, err, Hit); the
+// sibling test only exercises the unfinalized branch (Swap usually beats
+// the async setve), so the finalized path went unexercised.
+func TestSwap_OverFinalizedErroredWithStale(t *testing.T) {
+	c := New[string, int](MaxStaleAge(time.Hour))
+	c.Set("k", 1)
+	c.Expire("k")
+	c.Get("k", func() (int, error) { return 0, errors.New("boom") })
+
+	// Wait for the async setve to finalize the errored loading.
+	e := c.t.loadEntry("k")
+	for l := e.p.Load(); l == nil || !l.finalized(); l = e.p.Load() {
+		runtime.Gosched()
+	}
+
+	if v, err, s := c.TryGet("k"); s != Stale || v != 1 || err != nil {
+		t.Fatalf("TryGet: (%d, %v, %v), want (1, nil, Stale)", v, err, s)
+	}
+	old, oldErr, oldS := c.Swap("k", 2)
+	if oldS != Stale || old != 1 || oldErr != nil {
+		t.Fatalf("Swap: (%d, %v, %v), want (1, nil, Stale) to agree with TryGet", old, oldErr, oldS)
+	}
+}
+
+// TestSwap_OverFinalizedErroredNoStale covers the remaining finalized
+// classification arm: with no stale to return, an unexpired cached error
+// is itself the prior result, and Swap reports it as a Hit carrying the
+// error — agreeing with TryGet.
+func TestSwap_OverFinalizedErroredNoStale(t *testing.T) {
+	c := New[string, int]() // errors cache forever by default
+	// The driving Get waits for its load, so the error is finalized here.
+	c.Get("k", func() (int, error) { return 0, errors.New("boom") })
+
+	if _, err, s := c.TryGet("k"); err == nil || !s.IsHit() {
+		t.Fatalf("TryGet: err=%v s=%v, want the cached error as a Hit", err, s)
+	}
+	old, oldErr, oldS := c.Swap("k", 2)
+	if old != 0 || oldErr == nil || !oldS.IsHit() {
+		t.Fatalf("Swap: (%d, %v, %v), want (0, boom, Hit) to agree with TryGet", old, oldErr, oldS)
+	}
+}
+
+// TestDelete_ConcurrentlyFinalizedLoadReportsHit pins Delete's documented
+// classification race: Delete samples the clock before tombstoning, but
+// reads the loading's finalized state afterwards, so a load finalizing
+// between the two is reported as the removed value (a Hit) even though no
+// read ever observed it cached. This is Delete's exact code sequence with
+// the window held open; the returned triple is best effort there (see
+// Delete's doc), and the cache state itself is unaffected.
+func TestDelete_ConcurrentlyFinalizedLoadReportsHit(t *testing.T) {
+	c := New[string, int](MaxAge(time.Hour))
+	missRelease := make(chan struct{})
+	getDone := make(chan struct{})
+	go func() {
+		defer close(getDone)
+		c.Get("k", func() (int, error) { <-missRelease; return 7, nil })
+	}()
+	var e *ent[string, int]
+	for e = c.t.loadEntry("k"); e == nil; e = c.t.loadEntry("k") {
+		runtime.Gosched()
+	}
+
+	// Delete's sequence (see Cache.Delete), paused mid-window:
+	n := now()
+	was := entDel(e)
+	c.t.deleteEntryIf("k", entDead[string, int])
+	close(missRelease) // the miss finalizes the already-detached loading
+	<-getDone
+
+	if v, _, s := loadingTryGet(was, n, 0, c.cfg.maxStaleAge); !s.IsHit() || v != 7 {
+		t.Fatalf("classifying the concurrently finalized loading: (%d, %v), want (7, Hit) per Delete's documented race", v, s)
+	}
+	if _, _, s := c.TryGet("k"); !s.IsMiss() {
+		t.Fatalf("the key must be gone regardless: %v, want Miss", s)
+	}
+}
+
+// TestGet_CollapsedErrorWaitersRedrive pins the documented MaxErrorAge(0)
+// collapsing behavior (see MaxErrorAge): Gets that collapsed onto a load
+// that then errors do not share the error; each waiter re-drives its own
+// load in turn, so one erroring wave of N collapsed Gets issues N loads.
+func TestGet_CollapsedErrorWaitersRedrive(t *testing.T) {
+	c := New[string, int](MaxErrorAge(0))
+	var calls atomic.Int32
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var once sync.Once
+	miss := func() (int, error) {
+		if calls.Add(1) == 1 {
+			once.Do(func() { close(started) })
+			<-release
+		}
+		return 0, errors.New("boom")
+	}
+	const waiters = 8
+	var wg sync.WaitGroup
+	wg.Add(waiters)
+	for range waiters {
+		go func() { defer wg.Done(); c.Get("k", miss) }()
+	}
+	<-started
+	time.Sleep(20 * time.Millisecond) // let the others queue on the leader
+	close(release)
+	wg.Wait()
+	if n := calls.Load(); n != waiters {
+		t.Fatalf("miss ran %d times for %d collapsed Gets; with errors uncached, every Get drives exactly one load", n, waiters)
 	}
 }

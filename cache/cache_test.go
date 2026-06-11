@@ -499,10 +499,10 @@ func TestHugeAges(t *testing.T) {
 }
 
 // TestClean_RespectsValidStales verifies Clean never removes an entry whose
-// stale is still within its window. Born-expired entries (MaxAge(0) stores
-// the -1 expired sentinel) are the regression case: their MaxAge+MaxStaleAge
-// grace would otherwise anchor at the epoch instead of at the entry, so
-// Clean evicted stales that TryGet was still serving.
+// stale window is still open. Born-expired entries (MaxAge(0) stores a
+// negative, birth-carrying word) are the regression case: their
+// MaxAge+MaxStaleAge grace used to anchor at the epoch instead of at the
+// entry, so Clean evicted stales that TryGet was still serving.
 func TestClean_RespectsValidStales(t *testing.T) {
 	c := New[string, int](MaxAge(0), MaxStaleAge(50*time.Millisecond))
 	c.Set("k", 1)
@@ -527,17 +527,17 @@ func trieEntries[K comparable, V any](c *Cache[K, V]) (n int) {
 }
 
 // TestClean_ReclaimsBornExpired verifies Clean's handling of born-expired
-// entries (the expiredBorn sentinel: MaxAge(0) / MaxErrorAge(0)), whose -1
-// expiry word carries no entry-anchored timeline to add the MaxStaleAge
-// grace window to. Reclaim is gated on the stale instead: such an entry is
-// removed exactly when no valid stale remains (i.e. as soon as TryGet
-// reports Miss), regardless of process uptime.
+// entries (MaxAge(0) / MaxErrorAge(0), whose negative expiry word carries
+// the negated birth): an entry is removed exactly when no read can see it
+// anymore (i.e. as soon as TryGet reports Miss) — immediately for errored
+// stale-less entries, and exactly when the birth-anchored stale window
+// closes for values — regardless of process uptime.
 //
-// Regression test: the grace window used to be computed as
-// satAdd(-1, maxStaleAge), anchoring it at the process epoch — born-expired
-// stale-less entries (error churn under MaxErrorAge(0)) were unreclaimable
-// until process uptime exceeded MaxStaleAge, and forever for huge stale
-// ages.
+// Regression test: born-expired entries used to store a bare -1 sentinel,
+// and the grace window was computed as satAdd(-1, maxStaleAge), anchoring
+// it at the process epoch — born-expired stale-less entries (error churn
+// under MaxErrorAge(0)) were unreclaimable until process uptime exceeded
+// MaxStaleAge, and forever for huge stale ages.
 func TestClean_ReclaimsBornExpired(t *testing.T) {
 	t.Run("errored_no_stale", func(t *testing.T) {
 		c := New[string, int](MaxErrorAge(0), MaxStaleAge(time.Hour))
@@ -590,6 +590,166 @@ func TestClean_ReclaimsBornExpired(t *testing.T) {
 			t.Fatalf("Clean left %d entries whose stale window had passed", n)
 		}
 	})
+}
+
+// TestStale_BornExpiredAnchorsAtBirth verifies that a born-expired value's
+// (MaxAge(0)) stale window is anchored at the value's birth — carried by
+// the negated-birth expiry word — for every read and refresh. Once the
+// window passes, the value is gone for good: a later Get drives a fresh
+// load rather than serving the dead value.
+//
+// Regression test: born-expired values used to store a bare -1 sentinel,
+// destroying the birth; a Get-driven refresh arbitrarily later re-anchored
+// the dead value's stale at the refresh (newStale's expires<=0 fallback),
+// serving a value of unbounded age as a fresh Stale right after TryGet
+// certified Miss.
+func TestStale_BornExpiredAnchorsAtBirth(t *testing.T) {
+	const age = 50 * time.Millisecond
+	c := New[string, int](MaxAge(0), MaxStaleAge(age))
+	c.Set("k", 1)
+
+	// Within the window, the value is servable as a stale.
+	if v, _, s := c.TryGet("k"); s != Stale || v != 1 {
+		t.Fatalf("TryGet within the window: (%d, %v), want (1, Stale)", v, s)
+	}
+
+	time.Sleep(2 * age) // window passed; the value is certifiably dead
+	if _, _, s := c.TryGet("k"); !s.IsMiss() {
+		t.Fatalf("TryGet after the window: %v, want Miss", s)
+	}
+	v, _, s := c.Get("k", func() (int, error) { return 2, nil })
+	if v != 2 || s != Miss {
+		t.Fatalf("Get after the window: (%d, %v), want (2, Miss): the dead value must not be re-anchored at the refresh", v, s)
+	}
+}
+
+// TestStale_GetLoadedValueServesSelfStale verifies the stale window applies
+// uniformly regardless of how the value was written: a Get-loaded value,
+// once expired, is served as Stale by TryGet for MaxStaleAge, exactly like
+// a Set-loaded value.
+//
+// Regression test: only Set/Swap-created loadings used to carry a stale
+// snapshot of themselves; Get-loaded values had none (their stale field is
+// the previous generation's refresh companion), so TryGet reported Miss
+// the instant they expired while a Get-driven refresh of the same state
+// served the Stale.
+func TestStale_GetLoadedValueServesSelfStale(t *testing.T) {
+	const ttl = 20 * time.Millisecond
+	c := New[string, int](MaxAge(ttl), MaxStaleAge(time.Hour))
+	c.Get("k", func() (int, error) { return 1, nil })
+	time.Sleep(2 * ttl)
+	if v, _, s := c.TryGet("k"); s != Stale || v != 1 {
+		t.Fatalf("TryGet on an expired Get-loaded value: (%d, %v), want (1, Stale)", v, s)
+	}
+}
+
+// TestStale_ServesLatestGeneration verifies that once a refreshed value
+// itself expires, every read serves that value as the stale — not the
+// generation before it.
+//
+// Regression test: a Get-created loading's stale field is the previous
+// generation's snapshot; TryGet used to serve it (v1) after the refreshed
+// value (v2) expired, while a Get-driven refresh of the same state
+// snapshotted and served v2.
+func TestStale_ServesLatestGeneration(t *testing.T) {
+	const ttl = 30 * time.Millisecond
+	c := New[string, int](MaxAge(ttl), MaxStaleAge(time.Hour))
+	c.Set("k", 1)
+	time.Sleep(ttl + 10*time.Millisecond) // v1 expired; within its stale window
+
+	// Drive a refresh to v2; the driving Get returns the v1 stale while
+	// its (held-open) miss runs.
+	release := make(chan struct{})
+	if v, _, s := c.Get("k", func() (int, error) { <-release; return 2, nil }); s != Stale || v != 1 {
+		t.Fatalf("refreshing Get: (%d, %v), want (1, Stale)", v, s)
+	}
+	close(release)
+	time.Sleep(ttl + 20*time.Millisecond) // v2 finalized, then expired
+
+	if v, _, s := c.TryGet("k"); s != Stale || v != 2 {
+		t.Fatalf("TryGet after v2 expired: (%d, %v), want (2, Stale) — the freshest dead value", v, s)
+	}
+}
+
+// TestMaxIdleAge_StaleWindowFollowsExtensions verifies that the stale
+// window of an idle-extended entry anchors at the entry's actual death
+// (its last extension lapsing), not at its initial expiry: derived from
+// the expiry word, the window moves with every extension.
+//
+// Regression test: the self-stale used to be a snapshot frozen at
+// creation, anchored at the initial expiry. Extensions moved only the
+// expiry word, so an entry kept hot past initialExpiry+MaxStaleAge idled
+// out with its stale window already closed: TryGet reported Miss the
+// instant the entry expired while Get served the Stale.
+func TestMaxIdleAge_StaleWindowFollowsExtensions(t *testing.T) {
+	const (
+		ttl = 200 * time.Millisecond
+		age = 400 * time.Millisecond
+	)
+	c := New[string, int](MaxAge(ttl), MaxIdleAge(ttl), MaxStaleAge(age))
+	c.Set("k", 1)
+
+	// Keep the entry hot well past the initial expiry + age (600ms after
+	// the store), so a creation-frozen window would be long dead.
+	for range 8 { // ~640ms of extensions
+		time.Sleep(80 * time.Millisecond)
+		if _, _, s := c.TryGet("k"); !s.IsHit() {
+			t.Fatal("entry should still be live while being extended")
+		}
+	}
+	time.Sleep(ttl + 100*time.Millisecond) // idle out: died ~100ms ago
+
+	// ~100ms into the 400ms post-death window: still a Stale.
+	if v, _, s := c.TryGet("k"); s != Stale || v != 1 {
+		t.Fatalf("TryGet shortly after an idle-extended entry expired: (%d, %v), want (1, Stale)", v, s)
+	}
+	time.Sleep(age) // window passed
+	if _, _, s := c.TryGet("k"); !s.IsMiss() {
+		t.Fatalf("TryGet after the stale window: %v, want Miss", s)
+	}
+}
+
+// TestExpire_DoesNotResurrectDeadStale verifies that Expire on an entry
+// whose value and stale window are both already dead is a no-op: the next
+// Get drives a fresh load rather than serving the dead value.
+//
+// Regression test: Expire used to blindly store now()-1, moving an
+// already-expired word forward; the next Get-driven refresh anchored a
+// fresh stale window at the Expire and served the dead value as Stale for
+// up to another MaxStaleAge.
+func TestExpire_DoesNotResurrectDeadStale(t *testing.T) {
+	const ttl, age = 5 * time.Millisecond, 5 * time.Millisecond
+	c := New[string, int](MaxAge(ttl), MaxStaleAge(age))
+	c.Set("k", 1)
+	time.Sleep(30 * time.Millisecond) // value expired AND stale window passed
+	if _, _, s := c.TryGet("k"); !s.IsMiss() {
+		t.Fatalf("precondition: want Miss, got %v", s)
+	}
+	c.Expire("k") // invalidating a dead key must not revive anything
+	if v, _, s := c.Get("k", func() (int, error) { return 2, nil }); v != 2 || s != Miss {
+		t.Fatalf("Get after expiring a dead entry: (%d, %v), want (2, Miss)", v, s)
+	}
+}
+
+// TestExpire_StaleWindowAnchorsAtExpire verifies the uniform stale-window
+// anchor for manually expired values: the window opens at the Expire and
+// closes MaxStaleAge later, for TryGet and Get-driven refreshes alike.
+//
+// Regression test: TryGet used to serve a frozen creation-time snapshot
+// whose window was anchored at the original expiry (an hour out here),
+// outliving the documented Expire-anchored window.
+func TestExpire_StaleWindowAnchorsAtExpire(t *testing.T) {
+	const age = 50 * time.Millisecond
+	c := New[string, int](MaxAge(time.Hour), MaxStaleAge(age))
+	c.Set("k", 1)
+	c.Expire("k")
+	if v, _, s := c.TryGet("k"); s != Stale || v != 1 {
+		t.Fatalf("TryGet just after Expire: (%d, %v), want (1, Stale)", v, s)
+	}
+	time.Sleep(2 * age)
+	if _, _, s := c.TryGet("k"); !s.IsMiss() {
+		t.Fatalf("TryGet after the post-Expire window: %v, want Miss", s)
+	}
 }
 
 // TestCompareAndSwapAgreesWithTryGet verifies that CompareAndSwap and
