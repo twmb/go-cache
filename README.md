@@ -4,9 +4,13 @@ cache
 Package cache provides a concurrency safe, mostly lock-free, singleflight
 request collapsing generic cache with support for stale values.
 
-The guts of this package are similar to `sync.Map`, with minor differences in
-when the internal locked write-map is promoted an atomic read-only map, and
-major differences to support singleflight request collapsing.
+The internal storage is a concurrent hash-trie, modeled on Go's
+`internal/sync.HashTrieMap` (the backing of the current `sync.Map`) but
+implemented entirely in userspace via `hash/maphash` for the runtime's typed
+hasher. Loads are lock-free; inserts and deletes take only a per-bucket
+mutex, never a global one. On top of that storage the cache layers
+singleflight request collapsing, stale values, TTLs, idle-age extension, and
+error caching.
 
 Functions in this API that return a `KeyState` return the state last, rather
 than the error last: the value and error are cached as a single internal unit
@@ -34,9 +38,22 @@ value can be kept and returned from `Get` during a refresh / if a refresh
 fails. Keys can be manually expired with `Expire`. Internally expired values or
 errors can be occasionally cleaned with `Clean`.
 
-Out of an abundance of paranoia that this code is correct, there are unit tests
-to hit 97% coverage of the `cache.Cache` type. As well, all tests against
-`sync.Map` are copied into this library and used against `cache.Cache`.
+Out of an abundance of paranoia that this code is correct, the test suite
+layers several kinds of verification: unit tests at ~99% statement coverage
+of the cache and trie (the remainder being defensive panics at
+invariant-violation points and race-retry branches that require
+interleavings that cannot be forced from userspace); all of the stdlib
+`sync.Map` tests, copied into this library and run against `cache.Cache`; a
+property test comparing the cache to a `sync.RWMutex`-guarded `map` oracle
+over random operation sequences; a linearizability checker that runs batches
+of concurrent operations against single keys and verifies that a
+real-time-consistent sequential ordering explains every observed return;
+structural validation of the trie (hash placement, overflow chains, parent
+pointers, pruning) after each concurrent stress test; and regression hammers
+for specific interleaving bugs found by audit. CI runs the suite under the
+race detector on both amd64 and arm64 (whose weaker memory ordering
+surfaces reordering bugs that x86 hides), and without it on 32-bit
+linux/386.
 
 This package also provides a cached `Item` and a `Set`. `Item` can be used to
 populate an expensive value once and expire or replace it when needed, similar
@@ -54,87 +71,40 @@ Documentation
 Benchmarking
 ------------
 
-Some of the APIs are actually faster or more memory efficient than `sync.Map`
-because of generics. Some are slower and require more allocs because of the
-request collapsing aspect. Some benchmarks below show more CPU, but this is due
-to a few slight changes in how the write (dirty) map is internally promoted to
-the read map.
-
-The benchmarks are from the stdlib using a key and value of type int:
+Microbenchmarks on an Apple M1, Go 1.26, against the `CacheMap[int]` wrapper
+(`cache.Cache[int, any]` adapted to the `sync.Map` `mapInterface` so the
+stdlib benchmarks apply directly):
 
 ```
-name                          old time/op    new time/op    delta
-LoadMostlyHits                  12.8ns ±44%    14.0ns ±50%      ~     (p=0.393 n=10+10)
-LoadMostlyMisses                10.7ns ±53%     4.6ns ±47%   -57.31%  (p=0.000 n=10+10)
-LoadOrStoreBalanced              351ns ± 3%     705ns ±27%  +100.68%  (p=0.000 n=8+10)
-LoadOrStoreUnique                663ns ±13%    1296ns ±31%   +95.53%  (p=0.000 n=10+10)
-LoadOrStoreCollision            9.71ns ±60%   29.26ns ±46%  +201.44%  (p=0.000 n=10+10)
-LoadAndDeleteBalanced           11.2ns ±42%     7.1ns ±48%   -36.06%  (p=0.035 n=10+10)
-LoadAndDeleteUnique             9.19ns ±62%    4.17ns ±47%   -54.59%  (p=0.001 n=10+10)
-LoadAndDeleteCollision          10.9ns ±41%    14.3ns ±35%   +31.18%  (p=0.023 n=10+10)
-Range                           3.73µs ±48%    5.40µs ±45%      ~     (p=0.063 n=10+10)
-AdversarialAlloc                 298ns ±22%     259ns ±21%      ~     (p=0.063 n=10+10)
-AdversarialDelete               83.7ns ±14%   105.6ns ±20%      ~     (p=0.052 n=10+10)
-DeleteCollision                 6.87ns ±71%   4.86ns ±100%      ~     (p=0.424 n=10+10)
-SwapCollision                    201ns ±26%     266ns ±31%      ~     (p=0.143 n=10+10)
-SwapMostlyHits                  40.3ns ±42%    59.7ns ±51%      ~     (p=0.143 n=10+10)
-SwapMostlyMisses                 662ns ±18%     607ns ±24%    -8.19%  (p=0.023 n=10+10)
-CompareAndSwapCollision         33.4ns ±41%    24.9ns ±65%   -25.44%  (p=0.023 n=10+10)
-CompareAndSwapNoExistingKey     10.3ns ±46%     2.0ns ±53%   -80.15%  (p=0.000 n=10+10)
-CompareAndSwapValueNotEqual     9.64ns ±51%    6.02ns ±95%   -37.49%  (p=0.019 n=10+10)
-CompareAndSwapMostlyHits        46.9ns ±39%    56.8ns ±47%      ~     (p=0.143 n=10+10)
-CompareAndSwapMostlyMisses      22.9ns ±39%    13.4ns ±48%   -41.48%  (p=0.023 n=10+10)
-CompareAndDeleteCollision       28.1ns ±47%    18.3ns ±37%   -34.88%  (p=0.019 n=10+10)
-CompareAndDeleteMostlyHits      64.0ns ±38%    63.9ns ±52%      ~     (p=0.165 n=10+10)
-CompareAndDeleteMostlyMisses    18.3ns ±37%     8.7ns ±53%   -52.65%  (p=0.023 n=10+10)
-
-name                          old alloc/op   new alloc/op   delta
-LoadMostlyHits                   6.00B ± 0%     0.00B       -100.00%  (p=0.000 n=10+10)
-LoadMostlyMisses                 6.00B ± 0%     0.00B       -100.00%  (p=0.000 n=10+10)
-LoadOrStoreBalanced              74.7B ±16%    195.3B ± 1%  +161.45%  (p=0.000 n=10+10)
-LoadOrStoreUnique                 159B ± 7%      330B ± 7%  +107.15%  (p=0.000 n=9+10)
-LoadOrStoreCollision             0.00B         32.00B ± 0%     +Inf%  (p=0.000 n=10+10)
-LoadAndDeleteBalanced            4.00B ± 0%     0.00B       -100.00%  (p=0.000 n=10+10)
-LoadAndDeleteUnique              8.00B ± 0%     0.00B       -100.00%  (p=0.000 n=10+10)
-LoadAndDeleteCollision           1.00B ± 0%     1.00B ± 0%      ~     (all equal)
-Range                            16.0B ± 0%      0.0B       -100.00%  (p=0.000 n=10+10)
-AdversarialAlloc                 53.4B ± 3%     64.8B ± 3%   +21.35%  (p=0.000 n=10+10)
-AdversarialDelete                22.6B ±12%     39.0B ± 0%   +72.57%  (p=0.000 n=10+10)
-DeleteCollision                  0.00B          0.00B           ~     (all equal)
-SwapCollision                    16.0B ± 0%     80.0B ± 0%  +400.00%  (p=0.000 n=10+10)
-SwapMostlyHits                   28.0B ± 0%     86.0B ± 0%  +207.14%  (p=0.000 n=10+10)
-SwapMostlyMisses                  124B ± 0%      136B ± 1%    +9.71%  (p=0.000 n=10+10)
-CompareAndSwapCollision          7.60B ± 8%    21.70B ±17%  +185.53%  (p=0.000 n=10+10)
-CompareAndSwapNoExistingKey      8.00B ± 0%     0.00B       -100.00%  (p=0.000 n=10+10)
-CompareAndSwapValueNotEqual      0.00B          0.00B           ~     (all equal)
-CompareAndSwapMostlyHits         33.0B ± 0%     91.0B ± 0%  +175.76%  (p=0.000 n=10+10)
-CompareAndSwapMostlyMisses       23.0B ± 0%     16.0B ± 0%   -30.43%  (p=0.000 n=10+10)
-CompareAndDeleteCollision        0.00B          2.00B ± 0%     +Inf%  (p=0.000 n=10+8)
-CompareAndDeleteMostlyHits       39.0B ± 0%     90.6B ± 1%  +132.31%  (p=0.000 n=10+10)
-CompareAndDeleteMostlyMisses     16.0B ± 0%      8.0B ± 0%   -50.00%  (p=0.002 n=8+10)
-
-name                          old allocs/op  new allocs/op  delta
-LoadMostlyHits                    0.00           0.00           ~     (all equal)
-LoadMostlyMisses                  0.00           0.00           ~     (all equal)
-LoadOrStoreBalanced               2.00 ± 0%      3.00 ± 0%   +50.00%  (p=0.000 n=10+10)
-LoadOrStoreUnique                 4.00 ± 0%      5.00 ± 0%   +25.00%  (p=0.000 n=10+10)
-LoadOrStoreCollision              0.00           1.00 ± 0%     +Inf%  (p=0.000 n=10+10)
-LoadAndDeleteBalanced             0.00           0.00           ~     (all equal)
-LoadAndDeleteUnique              0.60 ±100%      0.00       -100.00%  (p=0.011 n=10+10)
-LoadAndDeleteCollision            0.00           0.00           ~     (all equal)
-Range                             1.00 ± 0%      0.00       -100.00%  (p=0.000 n=10+10)
-AdversarialAlloc                  1.00 ± 0%      0.00       -100.00%  (p=0.000 n=10+10)
-AdversarialDelete                 1.00 ± 0%      0.00       -100.00%  (p=0.000 n=10+10)
-DeleteCollision                   0.00           0.00           ~     (all equal)
-SwapCollision                     1.00 ± 0%      1.00 ± 0%      ~     (all equal)
-SwapMostlyHits                    2.00 ± 0%      1.00 ± 0%   -50.00%  (p=0.000 n=10+10)
-SwapMostlyMisses                  6.00 ± 0%      4.00 ± 0%   -33.33%  (p=0.000 n=10+10)
-CompareAndSwapCollision           0.00           0.00           ~     (all equal)
-CompareAndSwapNoExistingKey      0.50 ±100%      0.00       -100.00%  (p=0.033 n=10+10)
-CompareAndSwapValueNotEqual       0.00           0.00           ~     (all equal)
-CompareAndSwapMostlyHits          3.00 ± 0%      2.00 ± 0%   -33.33%  (p=0.000 n=10+10)
-CompareAndSwapMostlyMisses        2.00 ± 0%      1.00 ± 0%   -50.00%  (p=0.000 n=10+10)
-CompareAndDeleteCollision         0.00           0.00           ~     (all equal)
-CompareAndDeleteMostlyHits        3.00 ± 0%      2.00 ± 0%   -33.33%  (p=0.000 n=10+10)
-CompareAndDeleteMostlyMisses      1.00 ± 0%      0.00       -100.00%  (p=0.000 n=10+10)
+name                            time/op       alloc/op  allocs/op
+LoadMostlyHits                   10.3 ns/op     0 B/op   0 allocs/op
+LoadMostlyMisses                  5.2 ns/op     0 B/op   0 allocs/op
+LoadOrStoreBalanced               448 ns/op   151 B/op   3 allocs/op
+LoadOrStoreUnique                 567 ns/op   262 B/op   5 allocs/op
+LoadOrStoreCollision             45.6 ns/op    32 B/op   1 allocs/op
+LoadAndDeleteBalanced            4.88 ns/op     0 B/op   0 allocs/op
+LoadAndDeleteUnique              2.00 ns/op     0 B/op   0 allocs/op
+LoadAndDeleteCollision           20.2 ns/op     2 B/op   0 allocs/op
+Range                            8.64 µs/op     0 B/op   0 allocs/op
+AdversarialAlloc                 11.7 ns/op     0 B/op   0 allocs/op
+AdversarialDelete                7.17 ns/op     0 B/op   0 allocs/op
+DeleteCollision                  3.69 ns/op     0 B/op   0 allocs/op
+SwapCollision                     243 ns/op    80 B/op   1 allocs/op
+SwapMostlyHits                    119 ns/op    86 B/op   1 allocs/op
+SwapMostlyMisses                  160 ns/op   120 B/op   2 allocs/op
+CompareAndSwapCollision          13.1 ns/op     3 B/op   0 allocs/op
+CompareAndSwapNoExistingKey      2.57 ns/op     0 B/op   0 allocs/op
+CompareAndSwapValueNotEqual      10.6 ns/op     0 B/op   0 allocs/op
+CompareAndSwapMostlyHits          128 ns/op    91 B/op   2 allocs/op
+CompareAndSwapMostlyMisses       30.1 ns/op    16 B/op   1 allocs/op
+CompareAndDeleteCollision        13.0 ns/op     0 B/op   0 allocs/op
+CompareAndDeleteMostlyHits        112 ns/op    91 B/op   2 allocs/op
+CompareAndDeleteMostlyMisses     13.3 ns/op     8 B/op   0 allocs/op
 ```
+
+The per-op allocations on the `LoadOrStore*`, `Swap*`, and `CompareAndSwap*Hits`
+rows are intrinsic: each of these operations may install a fresh `loading[V]`
+in the trie's value slot, and that struct carries the singleflight machinery
+(`sync.Mutex`, `sync.WaitGroup`, atomic counters) that a plain `sync.Map` does
+not need. The lock-free-read paths (`Load*`, `Delete*`, `Range`, the
+`Adversarial*` patterns, and the `CompareAnd*Misses` paths) are alloc-free.

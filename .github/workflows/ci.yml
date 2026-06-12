@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test:
+    # amd64 and arm64: the trie/cache core is lock-free, and arm64's weaker
+    # memory ordering surfaces reordering bugs that x86's TSO hides.
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  test-386:
+    # 32-bit: uintptr hashes are 32 bits, so the trie is 8 levels deep
+    # instead of 16 and the test hash constants must fit the word size.
+    # The race detector is unsupported on 386, so this runs without it.
+    name: test (linux/386)
+    runs-on: ubuntu-latest
+    env:
+      GOARCH: "386"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go vet ./...
+      - run: go test ./...
