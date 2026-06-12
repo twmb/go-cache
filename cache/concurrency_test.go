@@ -1234,6 +1234,74 @@ func armExpiresPairingHook(t *testing.T) (entered, release chan struct{}) {
 	return entered, release
 }
 
+// armCASPublishHook installs casPublishHook such that exactly the first
+// tryCAS to pass through it blocks until release is closed; all later calls
+// pass straight through. The hook is cleared when the test ends.
+func armCASPublishHook(t *testing.T) (entered, release chan struct{}) {
+	t.Helper()
+	entered = make(chan struct{})
+	release = make(chan struct{})
+	var fired atomic.Bool
+	casPublishHook = func() {
+		if fired.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+	}
+	t.Cleanup(func() { casPublishHook = nil })
+	return entered, release
+}
+
+// TestTryCAS_RevalidatesLivenessBeforePublish pins tryCAS's pre-publish
+// re-validation: a CAS caller that matched a live value and was then
+// descheduled (the replacement's allocation is the widest such window in
+// the call) while the value's TTL lapsed must not publish — the value it
+// matched is one TryGet already certifies as Miss, and no sequential order
+// explains TryGet=Miss followed by CAS=true. The residual instructions
+// between the re-validation and the pointer CAS remain best effort (see
+// CompareAndSwap's doc).
+//
+// Regression test: tryCAS used to sample liveness only before the
+// allocation, so the entire alloc + deschedule window sat between the
+// liveness sample and the publish.
+func TestTryCAS_RevalidatesLivenessBeforePublish(t *testing.T) {
+	const ttl = 20 * time.Millisecond
+	for _, m := range []struct {
+		name string
+		op   func(c *Cache[string, int]) bool
+	}{
+		{"CompareAndSwap", func(c *Cache[string, int]) bool { return c.CompareAndSwap("k", 1, 2) }},
+		{"CompareAndDelete", func(c *Cache[string, int]) bool { return c.CompareAndDelete("k", 1) }},
+	} {
+		t.Run(m.name, func(t *testing.T) {
+			c := New[string, int](MaxAge(ttl))
+			c.Set("k", 1)
+
+			entered, release := armCASPublishHook(t)
+			res := make(chan bool, 1)
+			go func() { res <- m.op(c) }()
+			<-entered
+
+			// Let the matched value's TTL lapse while the caller is parked
+			// between its liveness sample and its publish.
+			for {
+				if _, _, s := c.TryGet("k"); s.IsMiss() {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			close(release)
+
+			if <-res {
+				t.Fatal("published against a value that expired mid-call (TryGet had already certified Miss)")
+			}
+			if _, _, s := c.TryGet("k"); !s.IsMiss() {
+				t.Fatalf("state after the failed publish: %v, want Miss", s)
+			}
+		})
+	}
+}
+
 // TestTryGet_PairedReadVsIdleExtension pins the coherence of the (expiry
 // word, clock) pair a read classifies with: a reader descheduled between
 // loading the word and sampling the clock, with an idle extension landing

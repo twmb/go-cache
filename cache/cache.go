@@ -272,6 +272,9 @@ func MaxIdleAge(age time.Duration) Opt {
 //
 // The goroutine holds a reference to the cache, so a cache that started
 // autocleaning is not garbage collected until StopAutoClean is called.
+//
+// If MaxStaleAge is negative (stales kept forever), Clean is a no-op and
+// the goroutine is not started at all.
 func AutoCleanInterval(interval time.Duration) Opt {
 	return opt{fn: func(c *cfg) { c.autoCleanInterval = interval }}
 }
@@ -729,6 +732,9 @@ func (c *Cache[K, V]) Set(k K, v V) {
 // loading without an error, is not expired, and is equal to old. The type V
 // must be comparable. Stale values are not considered: only the live value
 // is compared against.
+//
+// The expiry check is best effort: a value whose TTL lapses while the swap
+// is in flight may still be swapped.
 func (c *Cache[K, V]) CompareAndSwap(k K, old, new V) bool {
 	e := c.t.loadEntry(k)
 	if e == nil {
@@ -741,6 +747,9 @@ func (c *Cache[K, V]) CompareAndSwap(k K, old, new V) bool {
 // without an error, is not expired, and is equal to old. The type V must be
 // comparable. Stale values are not considered: only the live value is
 // compared against.
+//
+// The expiry check is best effort: a value whose TTL lapses while the
+// delete is in flight may still be deleted.
 func (c *Cache[K, V]) CompareAndDelete(k K, old V) bool {
 	e := c.t.loadEntry(k)
 	if e == nil {
@@ -764,14 +773,23 @@ func (c *Cache[K, V]) tryCAS(e *ent[K, V], old, new V, useNew bool) bool {
 	if useNew {
 		l2 = c.finalizedLoading(new)
 	}
+	if casPublishHook != nil {
+		casPublishHook()
+	}
 	for {
+		// Re-validate liveness immediately before publishing: the
+		// allocation above is the widest deschedule risk in this call, and
+		// a value whose TTL lapsed while we were parked there must not be
+		// matched — TryGet already reports it as Miss. The handful of
+		// instructions between this check and the CAS remain best effort
+		// (see CompareAndSwap).
+		if !casMatches(l, old) {
+			return false
+		}
 		if e.p.CompareAndSwap(l, l2) {
 			return true
 		}
 		l = e.p.Load()
-		if !casMatches(l, old) {
-			return false
-		}
 	}
 }
 
@@ -781,6 +799,12 @@ func (c *Cache[K, V]) tryCAS(e *ent[K, V], old, new V, useNew bool) bool {
 // errored entry is not a value that can be compared against (an errored
 // loading's v is whatever the miss function returned beside the error,
 // which was never cached as a value).
+//
+// The liveness sample cannot be made atomic with the publishing CAS: a
+// successful swap takes effect at the pointer CAS, and the clock cannot be
+// read at that exact instant. tryCAS narrows the gap by re-validating
+// immediately before each CAS attempt; the instructions-wide residue is
+// documented on CompareAndSwap and CompareAndDelete.
 func casMatches[V any](l *loading[V], old V) bool {
 	return l != nil && l.finalized() && l.err == nil &&
 		any(l.v) == any(old) && !l.expired(now())
@@ -933,6 +957,12 @@ func newStale[V any](v V, expires int64, age time.Duration) *stale[V] {
 // load and the clock sample, so tests can deterministically hold a reader
 // descheduled in that window. Never set in production code.
 var expiresPairingHook func()
+
+// casPublishHook, if non-nil, runs in tryCAS between the replacement
+// loading's allocation and the pre-publish liveness re-validation, so tests
+// can deterministically hold a CAS caller descheduled in that window. Never
+// set in production code.
+var casPublishHook func()
 
 // expiresNow returns the loading's expiry word and a clock sample forming a
 // coherent pair. The word is loaded before the clock is sampled: Expire
