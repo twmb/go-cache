@@ -615,7 +615,10 @@ func (c *Cache[K, V]) Clean() {
 	}
 }
 
-// Clear deletes all keys from the cache, resetting it to an empty state.
+// Clear deletes all keys from the cache, resetting it to an empty state. A
+// load in flight at the time of the Clear still completes and returns its
+// result to the Gets waiting on it, but the result is not cached: a later
+// Get for the same key misses and drives a fresh, independent load.
 func (c *Cache[K, V]) Clear() {
 	c.t.clear()
 }
@@ -1232,7 +1235,8 @@ func (i *Item[V]) CompareAndDelete(old V) (deleted bool) {
 	return i.c.CompareAndDelete(struct{}{}, old)
 }
 
-// Clear deletes the cached item, resetting the item to an empty state.
+// Clear deletes the cached item, resetting the item to an empty state. See
+// Cache.Clear for the in-flight-load caveat.
 func (i *Item[V]) Clear() {
 	i.c.Clear()
 }
@@ -1346,7 +1350,8 @@ func (s *Set[K]) Set(k K) {
 	s.c.Set(k, struct{}{})
 }
 
-// Clear deletes all keys from the set, resetting it to an empty state.
+// Clear deletes all keys from the set, resetting it to an empty state. See
+// Cache.Clear for the in-flight-load caveat.
 func (s *Set[K]) Clear() {
 	s.c.Clear()
 }

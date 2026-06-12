@@ -143,6 +143,52 @@ func TestDelete_DuringInFlightLoad(t *testing.T) {
 	}
 }
 
+// TestClear_DoesNotCacheInFlightLoads pins Clear's documented interplay with
+// in-flight loads (the per-key Delete caveat applied wholesale): Clear swaps
+// the trie root, so a load in flight at the Clear keeps running against the
+// detached tree — its result still reaches the Get waiting on it, but is
+// never cached, and a later Get misses and drives a fresh load.
+func TestClear_DoesNotCacheInFlightLoads(t *testing.T) {
+	c := New[string, int]()
+	missStart := make(chan struct{})
+	missRelease := make(chan struct{})
+
+	var getV int
+	var getDone sync.WaitGroup
+	getDone.Add(1)
+	go func() {
+		defer getDone.Done()
+		v, _, _ := c.Get("k", func() (int, error) {
+			close(missStart)
+			<-missRelease
+			return 5, nil
+		})
+		getV = v
+	}()
+
+	<-missStart
+	c.Clear()
+	close(missRelease)
+	getDone.Wait()
+
+	if getV != 5 {
+		t.Fatalf("in-flight Get got %d, want 5 (the load's result must still reach its waiter)", getV)
+	}
+
+	// The result must not have been cached: the next Get re-runs the miss.
+	var called bool
+	v, _, _ := c.Get("k", func() (int, error) {
+		called = true
+		return 6, nil
+	})
+	if !called {
+		t.Fatal("miss function should have run after Clear (the in-flight result must not be cached)")
+	}
+	if v != 6 {
+		t.Fatalf("post-Clear Get got %d, want 6", v)
+	}
+}
+
 // TestExpire_NoOpDuringInFlightLoad verifies the documented behavior: Expire
 // on an in-flight load is a no-op; the load completes with its normal TTL.
 func TestExpire_NoOpDuringInFlightLoad(t *testing.T) {
