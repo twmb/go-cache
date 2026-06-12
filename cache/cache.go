@@ -319,8 +319,10 @@ func initCache[K comparable, V any](c *Cache[K, V], opts ...Opt) {
 }
 
 // Get returns the cache value for k, running the miss function in a goroutine
-// if the key is not yet cached or the cached value has expired. If stale
-// values are enabled and an unexpired stale value exists — the currently
+// if the key is not yet cached, the cached value has expired, or the cached
+// value is an unexpired error with a valid stale to serve (a cached error
+// suppresses repeat queries only while no stale exists; see MaxErrorAge). If
+// stale values are enabled and an unexpired stale value exists — the currently
 // cached value has an error, or it expired with its stale window still open —
 // this returns the stale value and no error.
 //
@@ -1160,7 +1162,8 @@ func NewItem[V any](opts ...Opt) *Item[V] {
 }
 
 // Get returns the currently cached value, running the miss function in a
-// goroutine if the item is not yet cached or the cached value has expired. If
+// goroutine if the item is not yet cached, the cached value has expired, or
+// the cached value is an unexpired error with a valid stale to serve. If
 // stale values are enabled and an unexpired stale value exists — the
 // currently cached value has an error, or it expired with its stale window
 // still open — this returns the stale value and no error. See Cache.Get for
@@ -1273,7 +1276,8 @@ func NewSet[K comparable](opts ...Opt) *Set[K] {
 }
 
 // Get ensures the key is cached, running the miss function in a goroutine if
-// the key is not yet cached or the cached key has expired. If stale keys are
+// the key is not yet cached, the cached key has expired, or the cached key
+// holds an unexpired error with a valid stale to serve. If stale keys are
 // enabled and an unexpired stale exists — the currently cached key has an
 // error, or it expired with its stale window still open — this returns with
 // no error and a Stale key state. See Cache.Get for the miss function's
