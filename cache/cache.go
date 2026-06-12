@@ -516,6 +516,12 @@ func (c *Cache[K, V]) Expire(k K) {
 }
 
 // Range calls fn for every cached value. If fn returns false, iteration stops.
+//
+// Range does not necessarily correspond to any consistent snapshot of the
+// cache: no key is visited more than once, but if a key is set, deleted, or
+// expires concurrently (including from fn itself), Range may reflect any
+// state of that key from any point during the call. Range does not block
+// other methods on the cache; even fn may call them.
 func (c *Cache[K, V]) Range(fn func(K, V, error) bool) {
 	// When ranging, repeated time.Now() calls add up, so we get the
 	// current time when we enter range and avoid it in all tryGet calls.
@@ -1303,6 +1309,8 @@ func (s *Set[K]) Expire(k K) {
 }
 
 // Range calls fn for every cached key. If fn returns false, iteration stops.
+// See Cache.Range for the consistency caveats: no snapshot is taken, and no
+// key is visited more than once.
 func (s *Set[K]) Range(fn func(K, error) bool) {
 	s.c.Range(func(k K, _ struct{}, err error) bool {
 		return fn(k, err)
