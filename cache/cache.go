@@ -802,14 +802,24 @@ func (c *Cache[K, V]) tryCAS(e *ent[K, V], old, new V, useNew bool) bool {
 // loading's v is whatever the miss function returned beside the error,
 // which was never cached as a value).
 //
-// The liveness sample cannot be made atomic with the publishing CAS: a
-// successful swap takes effect at the pointer CAS, and the clock cannot be
-// read at that exact instant. tryCAS narrows the gap by re-validating
-// immediately before each CAS attempt; the instructions-wide residue is
-// documented on CompareAndSwap and CompareAndDelete.
+// Liveness is judged on a coherent (expiry word, clock) pair from
+// expiresNow, exactly as the read paths judge it: the clock postdates the
+// word it is paired with, so a kill that completed before the pair was
+// taken — a lapsed TTL, an Expire, a Clean claim — is always seen, no
+// matter how long this call was descheduled mid-check, while an idle
+// extension racing the pair re-derives rather than failing a
+// continuously-live match. The pair still cannot be made atomic with the
+// publishing CAS: a successful swap takes effect at the pointer CAS, and
+// the clock cannot be read at that exact instant. tryCAS re-validates
+// immediately before each CAS attempt; the instructions-wide residue
+// between that check and the CAS is documented on CompareAndSwap and
+// CompareAndDelete.
 func casMatches[V any](l *loading[V], old V) bool {
-	return l != nil && l.finalized() && l.err == nil &&
-		any(l.v) == any(old) && !l.expired(now())
+	if l == nil || !l.finalized() || l.err != nil || any(l.v) != any(old) {
+		return false
+	}
+	expires, n := l.expiresNow()
+	return expires == 0 || expires > n
 }
 
 ///////////////////

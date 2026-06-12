@@ -1221,11 +1221,19 @@ func TestGet_CollapsedErrorWaitersRedrive(t *testing.T) {
 // reads pass straight through. The hook is cleared when the test ends.
 func armExpiresPairingHook(t *testing.T) (entered, release chan struct{}) {
 	t.Helper()
+	return armExpiresPairingHookNth(t, 1)
+}
+
+// armExpiresPairingHookNth is armExpiresPairingHook parking the nth
+// (1-based) paired read instead of the first, for callers whose operation
+// takes multiple paired reads before the one under test.
+func armExpiresPairingHookNth(t *testing.T, nth int32) (entered, release chan struct{}) {
+	t.Helper()
 	entered = make(chan struct{})
 	release = make(chan struct{})
-	var fired atomic.Bool
+	var calls atomic.Int32
 	expiresPairingHook = func() {
-		if fired.CompareAndSwap(false, true) {
+		if calls.Add(1) == nth {
 			close(entered)
 			<-release
 		}
@@ -1335,6 +1343,87 @@ func TestTryCAS_RevalidationCatchesExpire(t *testing.T) {
 			}
 			if _, _, s := c.TryGet("k"); !s.IsMiss() {
 				t.Fatalf("state after the failed publish: %v, want Miss", s)
+			}
+		})
+	}
+}
+
+// TestTryCAS_RevalidationPairsWordAndClock pins HOW tryCAS's liveness
+// checks read expiry: as a coherent (expiry word, clock) pair, the clock
+// sampled after the word it judges (expiresNow, like every read path). A
+// CAS caller descheduled inside the re-validation itself — between
+// sampling the clock and loading the word, in the unpaired ordering —
+// would otherwise judge the fresh word against its stale clock and
+// publish against a value whose TTL had lapsed, or that a completed
+// Expire had killed, while it was parked: state TryGet already certifies
+// as Miss, so no sequential order explains TryGet=Miss followed by
+// CAS=true followed by TryGet=Hit(new). With the paired read, any kill
+// completed before the pair is taken is seen; only the instructions
+// between the re-validation and the pointer CAS remain best effort (see
+// CompareAndSwap's doc).
+//
+// The pairing hook parks the caller inside the re-validation's paired
+// read — the call's second paired read; the first is tryCAS's
+// pre-allocation filter — and the kill lands while it is parked.
+//
+// Regression test: casMatches used to evaluate now() and then load the
+// word (!l.expired(now())), so a deschedule between the two let both kill
+// modes through the re-validation.
+func TestTryCAS_RevalidationPairsWordAndClock(t *testing.T) {
+	const ttl = 200 * time.Millisecond
+	ops := []struct {
+		name string
+		op   func(c *Cache[string, int]) bool
+	}{
+		{"CompareAndSwap", func(c *Cache[string, int]) bool { return c.CompareAndSwap("k", 1, 2) }},
+		{"CompareAndDelete", func(c *Cache[string, int]) bool { return c.CompareAndDelete("k", 1) }},
+	}
+	kills := []struct {
+		name string
+		opts []Opt
+		kill func(c *Cache[string, int])
+	}{
+		{"ttl_lapse", []Opt{MaxAge(ttl)}, func(c *Cache[string, int]) {
+			// Let the matched value's TTL lapse while the caller is
+			// parked; the certifying TryGets' own paired reads pass
+			// straight through the one-shot hook.
+			for {
+				if _, _, s := c.TryGet("k"); s.IsMiss() {
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}},
+		{"expire", []Opt{MaxAge(time.Hour)}, func(c *Cache[string, int]) {
+			c.Expire("k")
+		}},
+	}
+	for _, k := range kills {
+		t.Run(k.name, func(t *testing.T) {
+			for _, m := range ops {
+				t.Run(m.name, func(t *testing.T) {
+					c := New[string, int](k.opts...)
+					c.Set("k", 1)
+
+					entered, release := armExpiresPairingHookNth(t, 2)
+					res := make(chan bool, 1)
+					go func() { res <- m.op(c) }()
+					select {
+					case <-entered:
+					case r := <-res:
+						t.Fatalf("op returned %v before its re-validation (pre-filter failed; value dead too early?)", r)
+					}
+
+					k.kill(c)
+					close(release)
+
+					if <-res {
+						t.Fatal("published against a value that was killed mid-validation (TryGet had already certified Miss)")
+					}
+					if _, _, s := c.TryGet("k"); !s.IsMiss() {
+						t.Fatalf("state after the failed publish: %v, want Miss", s)
+					}
+				})
 			}
 		})
 	}
