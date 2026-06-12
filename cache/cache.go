@@ -733,8 +733,9 @@ func (c *Cache[K, V]) Set(k K, v V) {
 // must be comparable. Stale values are not considered: only the live value
 // is compared against.
 //
-// The expiry check is best effort: a value whose TTL lapses while the swap
-// is in flight may still be swapped.
+// The expiry check is best effort: a value that expires while the swap is
+// in flight — its TTL lapsing or a concurrent Expire landing — may still
+// be swapped.
 func (c *Cache[K, V]) CompareAndSwap(k K, old, new V) bool {
 	e := c.t.loadEntry(k)
 	if e == nil {
@@ -748,8 +749,9 @@ func (c *Cache[K, V]) CompareAndSwap(k K, old, new V) bool {
 // comparable. Stale values are not considered: only the live value is
 // compared against.
 //
-// The expiry check is best effort: a value whose TTL lapses while the
-// delete is in flight may still be deleted.
+// The expiry check is best effort: a value that expires while the delete
+// is in flight — its TTL lapsing or a concurrent Expire landing — may
+// still be deleted.
 func (c *Cache[K, V]) CompareAndDelete(k K, old V) bool {
 	e := c.t.loadEntry(k)
 	if e == nil {
@@ -1192,14 +1194,16 @@ func (i *Item[V]) Swap(v V) (old V, oldErr error, oldState KeyState) {
 
 // CompareAndSwap swaps the old and new values if the value has finished
 // loading without an error, is not expired, and is equal to old. The type V
-// must be comparable.
+// must be comparable. See Cache.CompareAndSwap for the stale-handling and
+// best-effort expiry caveats.
 func (i *Item[V]) CompareAndSwap(old, new V) (swapped bool) {
 	return i.c.CompareAndSwap(struct{}{}, old, new)
 }
 
 // CompareAndDelete deletes the item if the value has finished loading
 // without an error, is not expired, and is equal to old. The type V must be
-// comparable.
+// comparable. See Cache.CompareAndDelete for the stale-handling and
+// best-effort expiry caveats.
 func (i *Item[V]) CompareAndDelete(old V) (deleted bool) {
 	return i.c.CompareAndDelete(struct{}{}, old)
 }

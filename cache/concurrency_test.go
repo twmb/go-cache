@@ -1302,6 +1302,44 @@ func TestTryCAS_RevalidatesLivenessBeforePublish(t *testing.T) {
 	}
 }
 
+// TestTryCAS_RevalidationCatchesExpire extends the pre-publish re-validation
+// pin to manual expiry: a CAS caller that matched a live value and was then
+// parked at the replacement's allocation while a concurrent Expire killed
+// the value must not publish — Expire's word write is visible to the
+// re-validation's fresh liveness check, the same way a lapsed TTL is. Only
+// the instructions between the re-validation and the pointer CAS remain
+// best effort for Expire, exactly as for a lapsing TTL (see
+// CompareAndSwap's doc).
+func TestTryCAS_RevalidationCatchesExpire(t *testing.T) {
+	for _, m := range []struct {
+		name string
+		op   func(c *Cache[string, int]) bool
+	}{
+		{"CompareAndSwap", func(c *Cache[string, int]) bool { return c.CompareAndSwap("k", 1, 2) }},
+		{"CompareAndDelete", func(c *Cache[string, int]) bool { return c.CompareAndDelete("k", 1) }},
+	} {
+		t.Run(m.name, func(t *testing.T) {
+			c := New[string, int](MaxAge(time.Hour))
+			c.Set("k", 1)
+
+			entered, release := armCASPublishHook(t)
+			res := make(chan bool, 1)
+			go func() { res <- m.op(c) }()
+			<-entered
+
+			c.Expire("k") // kills the matched value while the caller is parked
+			close(release)
+
+			if <-res {
+				t.Fatal("published against a value a concurrent Expire had already killed (TryGet certifies Miss)")
+			}
+			if _, _, s := c.TryGet("k"); !s.IsMiss() {
+				t.Fatalf("state after the failed publish: %v, want Miss", s)
+			}
+		})
+	}
+}
+
 // TestTryGet_PairedReadVsIdleExtension pins the coherence of the (expiry
 // word, clock) pair a read classifies with: a reader descheduled between
 // loading the word and sampling the clock, with an idle extension landing
