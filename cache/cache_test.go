@@ -461,6 +461,36 @@ func TestMaxIdleAge(t *testing.T) {
 	})
 }
 
+// TestMaxErrorAge_DefaultsToIdleInitialTTL pins the error-TTL default when
+// only MaxIdleAge is set (see MaxErrorAge's doc): the idle age is every
+// entry's initial TTL, errors included, so a load error is cached for the
+// idle age — not forever — and the next Get after it lapses retries. The
+// pre-expiry probe asserts the error is the cached result within the
+// window; it cannot mask a (regressed) idle extension of the errored entry,
+// because it runs immediately after the load, so even an extension anchored
+// at that access would lapse before the post-window probe.
+func TestMaxErrorAge_DefaultsToIdleInitialTTL(t *testing.T) {
+	const idle = 200 * time.Millisecond
+	c := New[string, int](MaxIdleAge(idle))
+	boom := errors.New("boom")
+	c.Get("k", func() (int, error) { return 0, boom })
+
+	if _, err, s := c.TryGet("k"); err == nil || !s.IsHit() {
+		t.Fatalf("TryGet within the idle window: err=%v s=%v, want the cached error as a Hit", err, s)
+	}
+
+	time.Sleep(2*idle + 50*time.Millisecond)
+	if _, _, s := c.TryGet("k"); !s.IsMiss() {
+		t.Fatalf("TryGet after the idle age: %v, want Miss (the error is not cached forever)", s)
+	}
+
+	var retried bool
+	v, err, s := c.Get("k", func() (int, error) { retried = true; return 7, nil })
+	if !retried || v != 7 || err != nil || s != Miss {
+		t.Fatalf("Get after the error lapsed: retried=%v (%d, %v, %v), want a fresh (7, nil, Miss) load", retried, v, err, s)
+	}
+}
+
 // TestHugeAges verifies expiry arithmetic saturates rather than wrapping:
 // absurd-but-valid Durations must mean "effectively forever", not "born
 // expired" (or, for Clean, "evict everything").

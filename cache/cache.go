@@ -225,9 +225,12 @@ func MaxAge(age time.Duration) Opt { return opt{fn: func(c *cfg) { c.maxAge, c.a
 func MaxStaleAge(age time.Duration) Opt { return opt{fn: func(c *cfg) { c.maxStaleAge = age }} }
 
 // MaxErrorAge sets the age to persist load errors. If not specified, the
-// default is MaxAge — so with neither option set, a load error is cached
-// forever and never retried (until Set, Swap, Delete, or Expire). Using
-// this option with 0 disables caching errors entirely.
+// default is MaxAge — or the idle age, when only MaxIdleAge is set, since
+// the idle age is then every entry's initial TTL (errors included, though an
+// errored entry is never idle-extended). With neither MaxAge nor MaxIdleAge
+// set, a load error is cached forever and never retried (until Set, Swap,
+// Delete, or Expire). Using this option with 0 disables caching errors
+// entirely.
 //
 // A cached error suppresses repeat queries only when there is no stale
 // value to return: if stale values are enabled and a valid stale exists,
