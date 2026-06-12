@@ -316,9 +316,10 @@ func initCache[K comparable, V any](c *Cache[K, V], opts ...Opt) {
 }
 
 // Get returns the cache value for k, running the miss function in a goroutine
-// if the key is not yet cached. If stale values are enabled, the currently
-// cached value has an error, and there is an unexpired stale value, this
-// returns the stale value and no error.
+// if the key is not yet cached or the cached value has expired. If stale
+// values are enabled and an unexpired stale value exists — the currently
+// cached value has an error, or it expired with its stale window still open —
+// this returns the stale value and no error.
 //
 // The miss function runs on an internal goroutine: if it panics, the process
 // crashes (the panic cannot be recovered by the Get caller); recover inside
@@ -1156,10 +1157,11 @@ func NewItem[V any](opts ...Opt) *Item[V] {
 }
 
 // Get returns the currently cached value, running the miss function in a
-// goroutine if the item is not yet cached. If stale values are enabled, the
-// currently cached value has an error, and there is an unexpired stale value,
-// this returns the stale value and no error. See Cache.Get for the miss
-// function's panic and re-entrancy caveats.
+// goroutine if the item is not yet cached or the cached value has expired. If
+// stale values are enabled and an unexpired stale value exists — the
+// currently cached value has an error, or it expired with its stale window
+// still open — this returns the stale value and no error. See Cache.Get for
+// the miss function's panic and re-entrancy caveats.
 func (i *Item[V]) Get(miss func() (V, error)) (v V, err error, state KeyState) {
 	return i.c.Get(struct{}{}, miss)
 }
@@ -1268,10 +1270,11 @@ func NewSet[K comparable](opts ...Opt) *Set[K] {
 }
 
 // Get ensures the key is cached, running the miss function in a goroutine if
-// the key is not yet cached. If stale keys are enabled, the currently cached
-// key has an error, and there is a stale key, this returns with no error and a
-// Stale key state. See Cache.Get for the miss function's panic and
-// re-entrancy caveats.
+// the key is not yet cached or the cached key has expired. If stale keys are
+// enabled and an unexpired stale exists — the currently cached key has an
+// error, or it expired with its stale window still open — this returns with
+// no error and a Stale key state. See Cache.Get for the miss function's
+// panic and re-entrancy caveats.
 func (s *Set[K]) Get(k K, miss func() error) (err error, state KeyState) {
 	_, err, state = s.c.Get(k, func() (struct{}, error) {
 		return struct{}{}, miss()
